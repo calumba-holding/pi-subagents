@@ -4443,9 +4443,7 @@ function resolveWorkflowResume(
 				if (target.kind !== "revive") throw new Error(`Workflow receipt child '${reference.key}' latest run '${runId}' is still running.`);
 			},
 		});
-		const runId = entry.latestRunId;
-		if (!runId) throw new Error(`Workflow receipt child '${reference.key}' has no retained run id.`);
-		return { runId, runIds: entry.continuation.runIds };
+		return { runId: entry.latestRunId, runIds: entry.continuation.runIds };
 	} catch (error) {
 		const workflowRunId = reference.workflowRunId.trim();
 		if (isMissingWorkflowReceiptDiagnostic(error, workflowRunId)) {
