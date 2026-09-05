@@ -317,22 +317,33 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("routes resume for live nested runs through the control inbox", async () => {
+	for (const workflow of [false, true]) it(`routes ${workflow ? "workflow string" : "action"} resume for live nested runs through the control inbox`, async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-live-resume-"));
 		try {
 			const emitted: Array<{ name: string; payload: unknown }> = [];
 			const events = { emit(name: string, payload: unknown) { emitted.push({ name, payload }); }, on() { return () => {}; } };
 			const route = createNestedRun("nested-live-resume", "running", { intercomTarget: "attacker-target", leafIntercomTarget: "attacker-leaf" });
 			const executor = createExecutor(stateWithNestedRoute(route), [], true, events);
-			setTimeout(() => {
-				const request = readNestedControlRequests(route)[0];
+			const responder = (async () => {
+				const deadline = Date.now() + 2_000;
+				let request = readNestedControlRequests(route)[0];
+				while (!request && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					request = readNestedControlRequests(route)[0];
+				}
 				assert.ok(request, "expected a nested resume request");
 				assert.equal(request.action, "resume");
 				assert.equal(request.message, "continue please");
 				writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "nested resume accepted" });
-			}, 50);
+			})();
 
-			const result = await executor.execute("resume", { action: "resume", id: "nested-live-resume", message: "continue please" }, new AbortController().signal, undefined, ctx(root));
+			const execution = Promise.resolve().then(() => executor.execute("resume", workflow
+				? { async: false, workflowScript: `return runs.run("live", { resume: "nested-live-resume", task: "continue please", output: false });` }
+				: { action: "resume", id: "nested-live-resume", message: "continue please" }, new AbortController().signal, undefined, ctx(root)));
+			const [response, executed] = await Promise.allSettled([responder, execution]);
+			if (response.status === "rejected") throw response.reason;
+			if (executed.status === "rejected") throw executed.reason;
+			const result = executed.value;
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), /nested resume accepted/);
@@ -387,13 +398,15 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("rejects stopped nested runs before attempting revival", async () => {
+	for (const workflow of [false, true]) it(`rejects stopped nested runs before ${workflow ? "workflow string resume" : "action revival"}`, async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-stopped-resume-"));
 		try {
 			const route = createNestedRun("nested-stopped-resume", "stopped", { sessionFile: path.join(root, "missing-session.jsonl") });
 
 			const result = await createExecutor(stateWithNestedRoute(route), [{ name: "worker", description: "Worker", prompt: "Do work" }])
-				.execute("resume", { action: "resume", id: "nested-stopped-resume", message: "continue" }, new AbortController().signal, undefined, ctx(root));
+				.execute("resume", workflow
+					? { async: false, workflowScript: `return runs.run("stopped", { resume: "nested-stopped-resume", task: "continue", output: false });` }
+					: { action: "resume", id: "nested-stopped-resume", message: "continue" }, new AbortController().signal, undefined, ctx(root));
 
 			assert.equal(result.isError, true);
 			assert.match(text(result), /was stopped and cannot be resumed/);

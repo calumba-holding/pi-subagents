@@ -905,7 +905,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		}
 	});
 
-	it("resume action revives completed multi-child async runs by index", async () => {
+	for (const workflow of [false, true]) it(`${workflow ? "workflow string resume" : "resume action"} revives completed multi-child async runs by index`, async () => {
 		mockPi.onCall({ output: "revived async child b" });
 		const runId = `resume-revive-multi-${Date.now()}`;
 		const asyncDir = path.join(ASYNC_DIR, runId);
@@ -933,17 +933,26 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 
 			const result = await executor.execute(
 				"resume-revive-multi",
-				{ action: "resume", id: runId, index: 1, message: "What did b find?" },
+				workflow
+					? { async: false, workflowScript: `return runs.run("indexed", { resume: ${JSON.stringify(runId)}, index: 1, task: "What did b find?", output: false });` }
+					: { action: "resume", id: runId, index: 1, message: "What did b find?" },
 				new AbortController().signal,
 				undefined,
 				makeMinimalCtx(tempDir),
 			);
 
 			assert.equal(result.isError, undefined);
-			assert.match(result.content[0]?.text ?? "", /Revived async subagent from/);
-			assert.match(result.details?.asyncId ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-			assert.match(result.content[0]?.text ?? "", /Agent: b/);
-			assert.match(result.content[0]?.text ?? "", new RegExp(secondSession.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+			if (workflow) {
+				const child = result.details!.workflow!.value as { runId: string; agent: string; continuation: { runIds: string[] } };
+				assert.equal(child.agent, "b");
+				assert.deepEqual(child.continuation.runIds, [runId, child.runId]);
+				assert.deepEqual(result.details!.workflow!.receipt!.entries.indexed.continuation, child.continuation);
+			} else {
+				assert.match(result.content[0]?.text ?? "", /Revived async subagent from/);
+				assert.match(result.details?.asyncId ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+				assert.match(result.content[0]?.text ?? "", /Agent: b/);
+				assert.match(result.content[0]?.text ?? "", new RegExp(secondSession.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+			}
 			const args = await readMockCallArgs(0);
 			assert.equal(args[args.indexOf("--session") + 1], secondSession);
 			assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4:high");
