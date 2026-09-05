@@ -7,7 +7,7 @@
  */
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { ChildProcess } from "node:child_process";
+import { ChildProcess, execFileSync } from "node:child_process";
 import { channel } from "node:diagnostics_channel";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -132,7 +132,7 @@ async function waitForAsyncResult(id: string, timeoutMs = 15_000): Promise<Async
 // Diagnostic only: retaining ChildProcess objects may perturb observer lifetime.
 // Neither callbacks nor these projections authorize cleanup.
 const ownedRunners = new Map<string, ReturnType<typeof observeRunner>>();
-function observeRunner(id: string, bodyStartedAt: number) {
+function observeRunner(id: string, bodyStartedAt: number, disableCompileCache: boolean) {
 	const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 	const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
 	const known = (value: unknown, values: string[]) => typeof value === "string" && values.includes(value) ? value : undefined;
@@ -152,7 +152,7 @@ function observeRunner(id: string, bodyStartedAt: number) {
 	};
 	const marks: Record<string, number> = { bodyStartedAt, launchStartedAt: Date.now() };
 	let pid: number | undefined;
-	let pidPresence: { at: number; state: string } | undefined;
+	let identity: Record<string, unknown> | undefined;
 	const notifications: unknown[] = [];
 	const processes: Array<{ proc: ChildProcess; events: unknown[]; dispose: () => void }> = [];
 	const diagnosticChannel = channel("child_process");
@@ -168,6 +168,72 @@ function observeRunner(id: string, bodyStartedAt: number) {
 		proc.once("spawn", spawn).once("error", error).once("exit", exit).once("close", close);
 		processes.push({ proc, events, dispose: () => { proc.off("spawn", spawn).off("error", error).off("exit", exit).off("close", close); } });
 	};
+	function queryIdentity(proc: ChildProcess | undefined): Record<string, unknown> {
+		const at = Date.now();
+		const config = proc?.spawnargs.at(-1);
+		if (process.platform !== "win32") return { at, state: "unavailable", reason: "platform" };
+		if (!proc || !path.isAbsolute(proc.spawnfile) || !config || !path.isAbsolute(config) || path.basename(config) !== `async-cfg-${id}.json`) {
+			return { at, state: "unavailable", reason: "correlation" };
+		}
+		try {
+			// CommandLineToArgvW avoids substring/quoting guesses. Only fixed projections leave PowerShell.
+			const script = `
+$ErrorActionPreference = 'Stop'
+try {
+  $p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -Property CreationDate,ExecutablePath,CommandLine
+  if ($null -eq $p) { '{"state":"missing"}'; return }
+  if (!$p.CreationDate -or !$p.ExecutablePath -or !$p.CommandLine) { '{"state":"unavailable"}'; return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class AcceptanceIdentity {
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern IntPtr CommandLineToArgvW(string line, out int count);
+  [DllImport("kernel32.dll")]
+  static extern IntPtr LocalFree(IntPtr memory);
+  public static bool Matches(string line, string config, int expectedCount) {
+    int count;
+    IntPtr args = CommandLineToArgvW(line, out count);
+    if (args == IntPtr.Zero) throw new InvalidOperationException();
+    try {
+      if (count != expectedCount) return false;
+      int matches = 0;
+      for (int i = 1; i < count; i++) {
+        string arg = Marshal.PtrToStringUni(Marshal.ReadIntPtr(args, i * IntPtr.Size));
+        if (String.Equals(arg, config, StringComparison.Ordinal)) matches++;
+        if (i == count - 1 && !String.Equals(arg, config, StringComparison.Ordinal)) return false;
+      }
+      return matches == 1;
+    } finally { LocalFree(args); }
+  }
+}
+'@
+  $exe = [string]::Equals($p.ExecutablePath, $env:ACCEPTANCE_EXPECTED_EXE, [StringComparison]::OrdinalIgnoreCase)
+  $config = [AcceptanceIdentity]::Matches($p.CommandLine, $env:ACCEPTANCE_EXPECTED_CONFIG, ${proc.spawnargs.length})
+  $state = if ($exe -and $config) { 'matched' } else { 'mismatch' }
+  @{ state=$state; creationTime=$p.CreationDate.ToUniversalTime().ToString('o'); executableMatches=$exe; configArgumentMatches=$config } | ConvertTo-Json -Compress
+} catch {
+  if ($_.Exception -is [UnauthorizedAccessException] -or $_.Exception.NativeErrorCode -eq 2) { '{"state":"permission-denied"}' }
+  else { '{"state":"unavailable"}' }
+}
+`;
+			const raw = record(JSON.parse(execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+				encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000, maxBuffer: 4096, windowsHide: true,
+				env: { ...process.env, ACCEPTANCE_EXPECTED_EXE: proc.spawnfile, ACCEPTANCE_EXPECTED_CONFIG: config },
+			})));
+			const state = known(raw.state, ["matched", "mismatch", "missing", "permission-denied", "unavailable"]) ?? "unavailable";
+			if (state !== "matched" && state !== "mismatch") return { at, completedAt: Date.now(), state };
+			if (typeof raw.creationTime !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/.test(raw.creationTime)
+				|| typeof raw.executableMatches !== "boolean" || typeof raw.configArgumentMatches !== "boolean"
+				|| (state === "matched") !== (raw.executableMatches && raw.configArgumentMatches)) {
+				return { at, completedAt: Date.now(), state: "unavailable", reason: "invalid-response" };
+			}
+			return { at, completedAt: Date.now(), state, creationTime: raw.creationTime, executableMatches: raw.executableMatches, configArgumentMatches: raw.configArgumentMatches };
+		} catch (error) {
+			const code = record(error).code;
+			return { at, completedAt: Date.now(), state: code === "ETIMEDOUT" ? "timeout" : code === "EACCES" || code === "EPERM" ? "permission-denied" : "unavailable" };
+		}
+	}
 	return {
 		marks,
 		emit(type: string, value: unknown) {
@@ -177,68 +243,103 @@ function observeRunner(id: string, bodyStartedAt: number) {
 			if (notifications.length < 8) notifications.push({ type, at: Date.now(), ...project(raw) });
 		},
 		launch(run: () => unknown) {
+			const nodeOptions = process.env.NODE_OPTIONS;
+			const previousDisableCompileCache = process.env.NODE_DISABLE_COMPILE_CACHE;
 			diagnosticChannel.subscribe(onProcess);
-			try { return run(); }
+			try {
+				process.env.NODE_OPTIONS = `${nodeOptions ?? ""} --trace-exit`;
+				if (disableCompileCache) process.env.NODE_DISABLE_COMPILE_CACHE = "1";
+				return run();
+			}
 			finally {
+				if (disableCompileCache) {
+					if (previousDisableCompileCache === undefined) delete process.env.NODE_DISABLE_COMPILE_CACHE;
+					else process.env.NODE_DISABLE_COMPILE_CACHE = previousDisableCompileCache;
+				}
+				if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
+				else process.env.NODE_OPTIONS = nodeOptions;
 				marks.launchFinishedAt = Date.now();
 				diagnosticChannel.unsubscribe(onProcess);
 				for (const entry of processes) if (pid === undefined || entry.proc.pid !== pid) entry.dispose();
 			}
 		},
-		snapshot(proof: unknown) {
-			const matched = processes.filter(({ proc }) => pid !== undefined && proc.pid === pid);
-			// Signal zero observes PID presence only, never identity, exit, or cleanup authority.
-			if (!pidPresence && matched.length === 1 && pid !== undefined && Number.isSafeInteger(pid) && pid > 0) {
-				const at = Date.now();
-				try { process.kill(pid, 0); pidPresence = { at, state: "present" }; }
-				catch (error) { pidPresence = { at, state: known(record(error).code, ["ESRCH", "EPERM", "EACCES"]) ?? "other-error" }; }
-			}
-			const read = (file: string, kind: "json" | "phases" | "journal" = "json") => {
-				const readAt = Date.now();
+		readEvidence(file: string, kind: "json" | "phases" | "journal" = "json") {
+			const matched = processes.filter(({ proc }) => pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && proc.pid === pid);
+			const readAt = Date.now();
+			try {
+				const fd = fs.openSync(file, "r");
 				try {
-					const fd = fs.openSync(file, "r");
-					try {
-						const size = fs.fstatSync(fd).size;
-						const limit = kind === "phases" ? 8192 : 65536;
-						if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
-						const offset = kind === "json" ? 0 : Math.max(0, size - limit);
-						const buffer = Buffer.alloc(Math.min(size, limit));
-						const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
-						const text = buffer.toString("utf-8", 0, bytes);
-						const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
-						if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
-						const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
-						const entries: unknown[] = [];
-						let parseErrors = 0;
-						for (const line of lines.filter(Boolean)) {
-							if (kind === "phases") {
-								const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
-								if (!match || matched.length !== 1) continue;
-								const [invocation, ts, markerPid] = match.slice(2).map(Number);
-								if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
-								if (match[1] === "exit" ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
-								entries.push({ phase: match[1], invocation, ts, pid: markerPid });
-							} else {
-								try {
-									const event = record(JSON.parse(line));
-									const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
-									if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
-								} catch { parseErrors++; }
+					const size = fs.fstatSync(fd).size;
+					const limit = kind === "phases" ? 8192 : 65536;
+					if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
+					const offset = kind === "json" ? 0 : Math.max(0, size - limit);
+					const buffer = Buffer.alloc(Math.min(size, limit));
+					const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+					const text = buffer.toString("utf-8", 0, bytes);
+					const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
+					if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
+					const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
+					const entries: unknown[] = [];
+					let parseErrors = 0;
+					for (const line of lines.filter(Boolean)) {
+						if (kind === "phases") {
+							if (matched.length !== 1) continue;
+							// Native Environment::Exit follows AtExit, precedes shutdown, and has no timestamp.
+							const trace = /^\(node:(\d{1,16})\) WARNING: Exited the environment with code (-?\d{1,10})\r?$/.exec(line);
+							if (trace && Number(trace[1]) === pid) {
+								entries.push({ phase: "native-trace-exit", pid, code: Number(trace[2]) });
+								continue;
 							}
+							const runtime = /^#1916 runtime node=(v\d{1,3}\.\d{1,3}\.\d{1,3}) uv=(\d{1,3}\.\d{1,3}\.\d{1,3}) cacheEnabled=(true|false|unavailable) pid=(\d{1,16})$/.exec(line);
+							if (runtime && Number(runtime[4]) === pid) {
+								entries.push({ phase: "runtime", node: runtime[1], uv: runtime[2], cacheEnabled: runtime[3] === "unavailable" ? "unavailable" : runtime[3] === "true", pid });
+								continue;
+							}
+							const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit|exit-request|exit-dispatch-return|exit-dispatch-throw) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
+							if (!match) continue;
+							const [invocation, ts, markerPid] = match.slice(2).map(Number);
+							if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
+							if (match[1]!.startsWith("exit") ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
+							entries.push({ phase: match[1], invocation, ts, pid: markerPid });
+						} else {
+							try {
+								const event = record(JSON.parse(line));
+								const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
+								if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
+							} catch { parseErrors++; }
 						}
-						return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
-					} finally { fs.closeSync(fd); }
-				} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
-			};
+					}
+					return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
+				} finally { fs.closeSync(fd); }
+			} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
+		},
+		snapshot(proof: unknown) {
+			const snapshotAt = Date.now();
+			const matched = processes.filter(({ proc }) => pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && proc.pid === pid);
+			const read = this.readEvidence;
 			const asyncDir = path.join(ASYNC_DIR!, id);
-			return {
-				id, pid, pidPresence, marks, notifications, lastProof: project(proof), snapshotAt: Date.now(),
+			const snapshot = {
+				id, pid, marks, notifications, lastProof: project(proof), snapshotAt,
 				capturedProcesses: processes.length,
 				processes: processes.filter(({ proc }) => pid !== undefined && proc.pid === pid).map(({ proc, events }) => ({ pid: proc.pid, exitCode: proc.exitCode, signalCode: known(proc.signalCode, ["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV"]), events })),
 				status: read(path.join(asyncDir, "status.json")), result: read(path.join(RESULTS_DIR!, `${id}.json`)),
 				candidate: read(path.join(asyncDir, "process-terminal-candidate.json")), proof: read(path.join(asyncDir, "process-terminal.json")),
 				phases: read(path.join(asyncDir, "runner.stderr.log"), "phases"), journal: read(path.join(asyncDir, "events.jsonl"), "journal"),
 			};
+			// One failure-only query, after the original evidence snapshot. Never cleanup authority.
+			identity ??= queryIdentity(matched.length === 1 ? matched[0]!.proc : undefined);
+			return { ...snapshot, identity };
+		},
+		measureControl(proof: unknown) {
+			if (!disableCompileCache) return;
+			try {
+				console.log("#1947 cache-disable-control " + JSON.stringify({
+					id, pid, measuredAt: Date.now(), proof: project(proof),
+					processes: processes.filter(({ proc }) => pid !== undefined && proc.pid === pid).map(({ proc, events }) => ({ pid: proc.pid, exitCode: proc.exitCode, events })),
+					phases: this.readEvidence(path.join(ASYNC_DIR!, id, "runner.stderr.log"), "phases"),
+				}));
+			}
+			catch { console.log('#1947 cache-disable-control {"measurement":"unavailable"}'); }
 		},
 		dispose() { for (const entry of processes) entry.dispose(); },
 	};
@@ -260,6 +361,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			// The reader validates identity/shape and treats absent or partial I/O as unproven.
 			proof = readProcessTerminal(asyncDir, { runId: id });
 			if (proof?.state === "observed") {
+				diagnostic.measureControl(proof);
 				diagnostic.dispose();
 				return;
 			}
@@ -561,12 +663,13 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 	});
 
 	describe("background runner", { skip: isAsyncAvailable && !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS) {
+		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS, disableCompileCache = false) {
 			const originalFactoryModule = childSessionFactoryModule();
 			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
 			const factoryPath = path.join(tempDir, "acceptance-exit-phases.mjs");
 			fs.writeFileSync(factoryPath, `
 import { writeSync } from "node:fs";
+import nodeModule from "node:module";
 import createFactory from ${JSON.stringify(pathToFileURL(originalFactoryModule).href)};
 export default function() {
   const factory = createFactory();
@@ -576,6 +679,24 @@ export default function() {
     try { writeSync(process.stderr.fd, "#1918 phase=" + phase + " invocation=" + call + " ts=" + Date.now() + " pid=" + process.pid + "\\n"); } catch {}
   };
   process.once("exit", () => mark("exit", 0));
+  const originalExit = process.exit;
+  const originalEmit = process.emit;
+  process.exit = function(...args) {
+    mark("exit-request", 0);
+    return Reflect.apply(originalExit, this, args);
+  };
+  process.emit = function(...args) {
+    if (args[0] !== "exit") return Reflect.apply(originalEmit, this, args);
+    try {
+      const result = Reflect.apply(originalEmit, this, args);
+      mark("exit-dispatch-return", 0);
+      return result;
+    } catch (error) { mark("exit-dispatch-throw", 0); throw error; }
+  };
+  try {
+    const cacheEnabled = typeof nodeModule.getCompileCacheDir === "function" ? Boolean(nodeModule.getCompileCacheDir()) : "unavailable";
+    writeSync(process.stderr.fd, "#1916 runtime node=" + process.version + " uv=" + process.versions.uv + " cacheEnabled=" + cacheEnabled + " pid=" + process.pid + "\\n");
+  } catch {}
   return {
     create(...args) { return factory.create(...args); },
     async dispose() {
@@ -590,7 +711,7 @@ export default function() {
   };
 }
 `);
-			const diagnostic = observeRunner(id, bodyStartedAt);
+			const diagnostic = observeRunner(id, bodyStartedAt, disableCompileCache);
 			// Register before launch so even a throwing launch cannot escape teardown ownership.
 			ownedRunners.set(id, diagnostic);
 			try {
@@ -618,7 +739,8 @@ export default function() {
 			const outputPath = path.join(tempDir, "async-report.md");
 			conflictingReportsCall(outputPath, "satisfied", "not-satisfied");
 			const id = `acceptance-file-report-${Date.now().toString(36)}`;
-			runAsyncSingle(id, outputPath, "file-only");
+			// One-variable control: only this launch disables Node's compile cache, not Jiti's transform cache.
+			runAsyncSingle(id, outputPath, "file-only", DISABLED_ARTIFACTS, true);
 
 			const payload = await waitForAsyncResult(id);
 			assert.equal(payload.success, true);

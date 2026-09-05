@@ -1292,11 +1292,8 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(status.steps?.find((step) => step.workflowKey === "work")?.phase, "Review");
 
 		fs.writeFileSync(releasePath, "go", "utf-8");
-		for (let attempt = 0; attempt < 100; attempt++) {
-			status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-			if (status.state === "complete" || status.state === "failed") break;
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
+		// Await persisted top-level logical completion, not a child process-terminal event.
+		status = JSON.parse(await waitForFileContent(statusPath, '\n  "state": "complete"'));
 		assert.equal(status.state, "complete");
 		assert.equal(status.steps?.find((step) => step.workflowKey === "work")?.phase, "Review");
 		assert.equal(mockPi.callCount(), 2);

@@ -27,6 +27,8 @@ jobs:
         run: npm test
       - name: Integration tests
         timeout-minutes: 10
+        env:
+          NODE_DISABLE_COMPILE_CACHE: '1'
         run: npm run test:integration
 
   bun-workflow-script:
