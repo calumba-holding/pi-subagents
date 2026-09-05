@@ -222,7 +222,13 @@ test("server supplementation is host-first, missing-only, and restricted to matc
 
 		for (const version of ["0.84.0", "0.85.1", "0.85.0-test"]) {
 			writePackage(host, "@earendil-works/pi-coding-agent", version, { ".": "./sdk.mjs" });
-			assert.deepEqual(resolveHostPeerAliases(host, extension).supplemental, []);
+			result = resolveHostPeerAliases(host, extension);
+			assert.deepEqual(result.supplemental, []);
+			for (const specifier of [server, `${server}/unix`, "@earendil-works/pi-client/unix"]) {
+				assert.ok(!result.missing.includes(specifier));
+				assert.equal(result.aliases[specifier], undefined);
+			}
+			assert.ok(result.missing.includes("@earendil-works/pi-agent-core/node"));
 		}
 		writePackage(host, "@earendil-works/pi-coding-agent", "0.85.0", { ".": "./sdk.mjs" });
 		writePackage(localServer, server, "0.85.1", exports);
@@ -231,20 +237,12 @@ test("server supplementation is host-first, missing-only, and restricted to matc
 		fs.unlinkSync(path.join(localServer, "unix.mjs"));
 		assert.ok(resolveHostPeerAliases(host, extension).missing.includes(`${server}/unix`));
 
-		// Complete hosts retain wildcard support and never need the preload.
+		// Non-exception hosts ignore experimental packages even when installed.
 		writePackage(host, "@earendil-works/pi-coding-agent", "0.86.0", { ".": "./sdk.mjs" });
 		writePackage(hostServer, server, "0.86.0", exports);
 		result = resolveHostPeerAliases(host, extension);
 		assert.deepEqual(result.supplemental, []);
-		assert.equal(result.aliases[`${server}/unix`], path.join(hostServer, "unix.mjs"));
-		for (const pkg of new Set(HOST_PEER_ALIASES.map(entry => entry.pkg))) {
-			const entries = HOST_PEER_ALIASES.filter(entry => entry.pkg === pkg);
-			const targets = Object.fromEntries(entries.map((entry, index) => [entry.subpath, `./export-${index}.mjs`]));
-			writePackage(pkg === "@earendil-works/pi-coding-agent" ? host : path.join(host, "node_modules", pkg), pkg, "0.86.0", targets);
-		}
-		result = resolveHostPeerAliases(host, extension);
-		assert.deepEqual(result.missing, []);
-		assert.deepEqual(result.supplemental, []);
+		assert.equal(result.aliases[`${server}/unix`], undefined);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
