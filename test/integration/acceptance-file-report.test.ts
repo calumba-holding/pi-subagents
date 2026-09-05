@@ -11,7 +11,9 @@ import { ChildProcess } from "node:child_process";
 import { channel } from "node:diagnostics_channel";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
+import { childSessionFactoryModule, setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import type { MockPi } from "../support/helpers.ts";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, makeMinimalCtx, tryImport } from "../support/helpers.ts";
 
@@ -150,6 +152,7 @@ function observeRunner(id: string, bodyStartedAt: number) {
 	};
 	const marks: Record<string, number> = { bodyStartedAt, launchStartedAt: Date.now() };
 	let pid: number | undefined;
+	let pidPresence: { at: number; state: string } | undefined;
 	const notifications: unknown[] = [];
 	const processes: Array<{ proc: ChildProcess; events: unknown[]; dispose: () => void }> = [];
 	const diagnosticChannel = channel("child_process");
@@ -183,24 +186,58 @@ function observeRunner(id: string, bodyStartedAt: number) {
 			}
 		},
 		snapshot(proof: unknown) {
-			const read = (file: string) => {
+			const matched = processes.filter(({ proc }) => pid !== undefined && proc.pid === pid);
+			// Signal zero observes PID presence only, never identity, exit, or cleanup authority.
+			if (!pidPresence && matched.length === 1 && pid !== undefined && Number.isSafeInteger(pid) && pid > 0) {
+				const at = Date.now();
+				try { process.kill(pid, 0); pidPresence = { at, state: "present" }; }
+				catch (error) { pidPresence = { at, state: known(record(error).code, ["ESRCH", "EPERM", "EACCES"]) ?? "other-error" }; }
+			}
+			const read = (file: string, kind: "json" | "phases" | "journal" = "json") => {
+				const readAt = Date.now();
 				try {
 					const fd = fs.openSync(file, "r");
 					try {
-						const buffer = Buffer.alloc(64 * 1024 + 1);
-						const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
-						if (bytes === buffer.length) return { io: "oversized" };
-						return { io: "readable", ...project(JSON.parse(buffer.toString("utf-8", 0, bytes))) };
+						const size = fs.fstatSync(fd).size;
+						const limit = kind === "phases" ? 8192 : 65536;
+						if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
+						const offset = kind === "json" ? 0 : Math.max(0, size - limit);
+						const buffer = Buffer.alloc(Math.min(size, limit));
+						const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+						const text = buffer.toString("utf-8", 0, bytes);
+						const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
+						if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
+						const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
+						const entries: unknown[] = [];
+						let parseErrors = 0;
+						for (const line of lines.filter(Boolean)) {
+							if (kind === "phases") {
+								const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
+								if (!match || matched.length !== 1) continue;
+								const [invocation, ts, markerPid] = match.slice(2).map(Number);
+								if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
+								if (match[1] === "exit" ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
+								entries.push({ phase: match[1], invocation, ts, pid: markerPid });
+							} else {
+								try {
+									const event = record(JSON.parse(line));
+									const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
+									if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
+								} catch { parseErrors++; }
+							}
+						}
+						return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
 					} finally { fs.closeSync(fd); }
-				} catch (error) { return { io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
+				} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
 			};
 			const asyncDir = path.join(ASYNC_DIR!, id);
 			return {
-				id, pid, marks, notifications, lastProof: project(proof), snapshotAt: Date.now(),
+				id, pid, pidPresence, marks, notifications, lastProof: project(proof), snapshotAt: Date.now(),
 				capturedProcesses: processes.length,
 				processes: processes.filter(({ proc }) => pid !== undefined && proc.pid === pid).map(({ proc, events }) => ({ pid: proc.pid, exitCode: proc.exitCode, signalCode: known(proc.signalCode, ["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV"]), events })),
 				status: read(path.join(asyncDir, "status.json")), result: read(path.join(RESULTS_DIR!, `${id}.json`)),
 				candidate: read(path.join(asyncDir, "process-terminal-candidate.json")), proof: read(path.join(asyncDir, "process-terminal.json")),
+				phases: read(path.join(asyncDir, "runner.stderr.log"), "phases"), journal: read(path.join(asyncDir, "events.jsonl"), "journal"),
 			};
 		},
 		dispose() { for (const entry of processes) entry.dispose(); },
@@ -525,22 +562,56 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 
 	describe("background runner", { skip: isAsyncAvailable && !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
 		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS) {
+			const originalFactoryModule = childSessionFactoryModule();
+			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
+			const factoryPath = path.join(tempDir, "acceptance-exit-phases.mjs");
+			fs.writeFileSync(factoryPath, `
+import { writeSync } from "node:fs";
+import createFactory from ${JSON.stringify(pathToFileURL(originalFactoryModule).href)};
+export default function() {
+  const factory = createFactory();
+  let invocation = 0;
+  const mark = (phase, call) => {
+    if (call > 8) return;
+    try { writeSync(process.stderr.fd, "#1918 phase=" + phase + " invocation=" + call + " ts=" + Date.now() + " pid=" + process.pid + "\\n"); } catch {}
+  };
+  process.once("exit", () => mark("exit", 0));
+  return {
+    create(...args) { return factory.create(...args); },
+    async dispose() {
+      const call = ++invocation;
+      mark("dispose-entry", call);
+      try {
+        const result = await factory.dispose();
+        mark("dispose-return", call);
+        return result;
+      } catch (error) { mark("dispose-rejection", call); throw error; }
+    },
+  };
+}
+`);
 			const diagnostic = observeRunner(id, bodyStartedAt);
 			// Register before launch so even a throwing launch cannot escape teardown ownership.
 			ownedRunners.set(id, diagnostic);
-			diagnostic.launch(() => executeAsyncSingle!(id, {
-				agent: "worker",
-				task: "Write the findings report.",
-				agentConfig: makeAgent("worker", { completionGuard: false }),
-				ctx: { pi: { events: { emit: diagnostic.emit } }, cwd: tempDir, currentSessionId: "session-file-report" },
-				artifactConfig,
-				artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),
-				shareEnabled: false,
-				maxSubagentDepth: 2,
-				output: outputPath,
-				outputMode,
-				acceptance: { level: "checked", criteria: ["Report the findings"] },
-			}));
+			try {
+				setChildSessionFactoryModule(factoryPath);
+				diagnostic.launch(() => executeAsyncSingle!(id, {
+					agent: "worker",
+					task: "Write the findings report.",
+					agentConfig: makeAgent("worker", { completionGuard: false }),
+					ctx: { pi: { events: { emit: diagnostic.emit } }, cwd: tempDir, currentSessionId: "session-file-report" },
+					artifactConfig,
+					artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),
+					shareEnabled: false,
+					maxSubagentDepth: 2,
+					output: outputPath,
+					outputMode,
+					acceptance: { level: "checked", criteria: ["Report the findings"] },
+				}));
+			} finally {
+				// Launch captures the module path synchronously; restoring it does not release owned fixtures.
+				setChildSessionFactoryModule(originalFactoryModule);
+			}
 		}
 
 		it("file-only mode accepts from the child-written file when the text report fails", async () => {
