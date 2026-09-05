@@ -7,10 +7,15 @@
  */
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { ChildProcess } from "node:child_process";
+import { channel } from "node:diagnostics_channel";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
+import { childSessionFactoryModule, setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import type { MockPi } from "../support/helpers.ts";
-import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, makeMinimalCtx, tryImport } from "../support/helpers.ts";
 
 interface AcceptanceSummary {
 	status?: string;
@@ -111,18 +116,161 @@ function acceptanceReport(criterionStatus: "satisfied" | "not-satisfied", eviden
 }
 
 async function waitForAsyncResult(id: string, timeoutMs = 15_000): Promise<AsyncResultPayload> {
+	const marks = ownedRunners.get(id)?.marks;
+	if (marks) marks.resultWaitStartedAt = Date.now();
 	const resultPath = path.join(RESULTS_DIR!, `${id}.json`);
 	const deadline = Date.now() + timeoutMs;
 	while (!fs.existsSync(resultPath)) {
 		if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
-	return JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+	const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+	if (marks) marks.resultReadAt = Date.now();
+	return payload;
+}
+
+// Diagnostic only: retaining ChildProcess objects may perturb observer lifetime.
+// Neither callbacks nor these projections authorize cleanup.
+const ownedRunners = new Map<string, ReturnType<typeof observeRunner>>();
+function observeRunner(id: string, bodyStartedAt: number) {
+	const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+	const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+	const known = (value: unknown, values: string[]) => typeof value === "string" && values.includes(value) ? value : undefined;
+	const errorCode = (error: unknown) => known(record(error).code, ["ENOENT", "EACCES", "EPERM", "EBUSY", "EIO", "EMFILE", "ENFILE", "ENOSPC"]) ?? "other";
+	const project = (value: unknown) => {
+		const raw = record(value);
+		return {
+			runMatches: (raw.runId ?? raw.id) === id,
+			runnerProcessInstanceId: typeof raw.runnerProcessInstanceId === "string" && /^[a-zA-Z0-9:-]{1,128}$/.test(raw.runnerProcessInstanceId) ? raw.runnerProcessInstanceId : undefined,
+			state: known(raw.state, ["pending", "running", "complete", "failed", "stopped", "paused", "observed", "unknown", "not-started"]),
+			reason: known(raw.reason, ["runner-candidate-missing", "runner-instance-mismatch", "writer-close-unverified", "process-tree-unverified", "canonical-session-unavailable", "canonical-session-lease-active", "canonical-session-release-unverified", "proof-write-failed"]),
+			pid: number(raw.pid), startedAt: number(raw.startedAt), endedAt: number(raw.endedAt), observedAt: number(raw.observedAt),
+			success: typeof raw.success === "boolean" ? raw.success : undefined,
+			writerCount: Array.isArray(record(raw.writers)["0"]) ? record(raw.writers)["0"].length : undefined,
+			expectedWriters: number(record(raw.expectedWriters)["0"]),
+		};
+	};
+	const marks: Record<string, number> = { bodyStartedAt, launchStartedAt: Date.now() };
+	let pid: number | undefined;
+	let pidPresence: { at: number; state: string } | undefined;
+	const notifications: unknown[] = [];
+	const processes: Array<{ proc: ChildProcess; events: unknown[]; dispose: () => void }> = [];
+	const diagnosticChannel = channel("child_process");
+	const onProcess = (message: unknown) => {
+		const proc = record(message).process;
+		if (!(proc instanceof ChildProcess) || processes.length >= 8) return;
+		const events: unknown[] = [];
+		const add = (type: string, code?: number | null, signal?: string | null) => events.push({ type, at: Date.now(), code, signal: signal === null ? null : known(signal, ["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV"]) });
+		const spawn = () => add("spawn");
+		const error = (err: Error) => events.push({ type: "error", at: Date.now(), code: errorCode(err) });
+		const exit = (code: number | null, signal: string | null) => add("exit", code, signal);
+		const close = (code: number | null, signal: string | null) => add("close", code, signal);
+		proc.once("spawn", spawn).once("error", error).once("exit", exit).once("close", close);
+		processes.push({ proc, events, dispose: () => { proc.off("spawn", spawn).off("error", error).off("exit", exit).off("close", close); } });
+	};
+	return {
+		marks,
+		emit(type: string, value: unknown) {
+			const raw = record(value);
+			if (type === "subagent:async-started" && raw.id === id) pid = number(raw.pid);
+			else if (type !== "subagent:process-terminal" || raw.runId !== id) return;
+			if (notifications.length < 8) notifications.push({ type, at: Date.now(), ...project(raw) });
+		},
+		launch(run: () => unknown) {
+			diagnosticChannel.subscribe(onProcess);
+			try { return run(); }
+			finally {
+				marks.launchFinishedAt = Date.now();
+				diagnosticChannel.unsubscribe(onProcess);
+				for (const entry of processes) if (pid === undefined || entry.proc.pid !== pid) entry.dispose();
+			}
+		},
+		snapshot(proof: unknown) {
+			const matched = processes.filter(({ proc }) => pid !== undefined && proc.pid === pid);
+			// Signal zero observes PID presence only, never identity, exit, or cleanup authority.
+			if (!pidPresence && matched.length === 1 && pid !== undefined && Number.isSafeInteger(pid) && pid > 0) {
+				const at = Date.now();
+				try { process.kill(pid, 0); pidPresence = { at, state: "present" }; }
+				catch (error) { pidPresence = { at, state: known(record(error).code, ["ESRCH", "EPERM", "EACCES"]) ?? "other-error" }; }
+			}
+			const read = (file: string, kind: "json" | "phases" | "journal" = "json") => {
+				const readAt = Date.now();
+				try {
+					const fd = fs.openSync(file, "r");
+					try {
+						const size = fs.fstatSync(fd).size;
+						const limit = kind === "phases" ? 8192 : 65536;
+						if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
+						const offset = kind === "json" ? 0 : Math.max(0, size - limit);
+						const buffer = Buffer.alloc(Math.min(size, limit));
+						const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+						const text = buffer.toString("utf-8", 0, bytes);
+						const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
+						if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
+						const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
+						const entries: unknown[] = [];
+						let parseErrors = 0;
+						for (const line of lines.filter(Boolean)) {
+							if (kind === "phases") {
+								const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
+								if (!match || matched.length !== 1) continue;
+								const [invocation, ts, markerPid] = match.slice(2).map(Number);
+								if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
+								if (match[1] === "exit" ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
+								entries.push({ phase: match[1], invocation, ts, pid: markerPid });
+							} else {
+								try {
+									const event = record(JSON.parse(line));
+									const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
+									if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
+								} catch { parseErrors++; }
+							}
+						}
+						return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
+					} finally { fs.closeSync(fd); }
+				} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
+			};
+			const asyncDir = path.join(ASYNC_DIR!, id);
+			return {
+				id, pid, pidPresence, marks, notifications, lastProof: project(proof), snapshotAt: Date.now(),
+				capturedProcesses: processes.length,
+				processes: processes.filter(({ proc }) => pid !== undefined && proc.pid === pid).map(({ proc, events }) => ({ pid: proc.pid, exitCode: proc.exitCode, signalCode: known(proc.signalCode, ["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV"]), events })),
+				status: read(path.join(asyncDir, "status.json")), result: read(path.join(RESULTS_DIR!, `${id}.json`)),
+				candidate: read(path.join(asyncDir, "process-terminal-candidate.json")), proof: read(path.join(asyncDir, "process-terminal.json")),
+				phases: read(path.join(asyncDir, "runner.stderr.log"), "phases"), journal: read(path.join(asyncDir, "events.jsonl"), "journal"),
+			};
+		},
+		dispose() { for (const entry of processes) entry.dispose(); },
+	};
 }
 
 describe("acceptance file reports", { skip: !runSync ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
+	let bodyStartedAt: number;
+	let terminalBarrier: Promise<void> | undefined;
+
+	async function waitForOwnedRunner(id: string): Promise<void> {
+		const diagnostic = ownedRunners.get(id)!;
+		diagnostic.marks.teardownStartedAt = Date.now();
+		const asyncDir = path.join(ASYNC_DIR!, id);
+		const deadline = Date.now() + 10_000;
+		let proof;
+		do {
+			// The reader validates identity/shape and treats absent or partial I/O as unproven.
+			proof = readProcessTerminal(asyncDir, { runId: id });
+			if (proof?.state === "observed") {
+				diagnostic.dispose();
+				return;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		} while (Date.now() <= deadline);
+		let evidence: unknown;
+		try { evidence = diagnostic.snapshot(proof); }
+		catch { evidence = { snapshot: "unavailable" }; }
+		finally { diagnostic.dispose(); }
+		assert.fail(`No terminal proof for owned runner ${id}; retaining ${tempDir} and mock queue ${mockPi.dir}. Diagnostics: ${JSON.stringify(evidence)}`);
+	}
 
 	before(() => {
 		mockPi = createMockPi();
@@ -130,16 +278,24 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 	});
 
 	after(() => {
+		assert.equal(ownedRunners.size, 0, "Unproven owned runners: retain the mock queue");
 		mockPi.uninstall();
 	});
 
 	beforeEach(() => {
+		assert.equal(ownedRunners.size, 0, "Unproven owned runners: do not reset the mock queue");
+		terminalBarrier = undefined;
 		tempDir = createTempDir();
 		mockPi.reset();
+		bodyStartedAt = Date.now();
 	});
 
-	afterEach(() => {
-		removeTempDir(tempDir);
+	afterEach(async () => {
+		// Result publication precedes runner close. Also drain on assertion/result-wait failure.
+		// Cache a failed barrier so later hooks cannot retry cleanup or reset shared state.
+		terminalBarrier ??= Promise.all([...ownedRunners.keys()].map(waitForOwnedRunner)).then(() => { ownedRunners.clear(); });
+		await terminalBarrier;
+		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
 	function conflictingReportsCall(outputPath: string, fileStatus: "satisfied" | "not-satisfied", textStatus: "satisfied" | "not-satisfied") {
@@ -406,19 +562,56 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 
 	describe("background runner", { skip: isAsyncAvailable && !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
 		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS) {
-			executeAsyncSingle!(id, {
-				agent: "worker",
-				task: "Write the findings report.",
-				agentConfig: makeAgent("worker", { completionGuard: false }),
-				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-file-report" },
-				artifactConfig,
-				artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),
-				shareEnabled: false,
-				maxSubagentDepth: 2,
-				output: outputPath,
-				outputMode,
-				acceptance: { level: "checked", criteria: ["Report the findings"] },
-			});
+			const originalFactoryModule = childSessionFactoryModule();
+			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
+			const factoryPath = path.join(tempDir, "acceptance-exit-phases.mjs");
+			fs.writeFileSync(factoryPath, `
+import { writeSync } from "node:fs";
+import createFactory from ${JSON.stringify(pathToFileURL(originalFactoryModule).href)};
+export default function() {
+  const factory = createFactory();
+  let invocation = 0;
+  const mark = (phase, call) => {
+    if (call > 8) return;
+    try { writeSync(process.stderr.fd, "#1918 phase=" + phase + " invocation=" + call + " ts=" + Date.now() + " pid=" + process.pid + "\\n"); } catch {}
+  };
+  process.once("exit", () => mark("exit", 0));
+  return {
+    create(...args) { return factory.create(...args); },
+    async dispose() {
+      const call = ++invocation;
+      mark("dispose-entry", call);
+      try {
+        const result = await factory.dispose();
+        mark("dispose-return", call);
+        return result;
+      } catch (error) { mark("dispose-rejection", call); throw error; }
+    },
+  };
+}
+`);
+			const diagnostic = observeRunner(id, bodyStartedAt);
+			// Register before launch so even a throwing launch cannot escape teardown ownership.
+			ownedRunners.set(id, diagnostic);
+			try {
+				setChildSessionFactoryModule(factoryPath);
+				diagnostic.launch(() => executeAsyncSingle!(id, {
+					agent: "worker",
+					task: "Write the findings report.",
+					agentConfig: makeAgent("worker", { completionGuard: false }),
+					ctx: { pi: { events: { emit: diagnostic.emit } }, cwd: tempDir, currentSessionId: "session-file-report" },
+					artifactConfig,
+					artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),
+					shareEnabled: false,
+					maxSubagentDepth: 2,
+					output: outputPath,
+					outputMode,
+					acceptance: { level: "checked", criteria: ["Report the findings"] },
+				}));
+			} finally {
+				// Launch captures the module path synchronously; restoring it does not release owned fixtures.
+				setChildSessionFactoryModule(originalFactoryModule);
+			}
 		}
 
 		it("file-only mode accepts from the child-written file when the text report fails", async () => {
