@@ -115,7 +115,7 @@ import { handleHerdrInspectorAction, HERDR_INSPECTOR_ACTIONS } from "../../inspe
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
 import { previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, type WorkflowLanePlan, type WorkflowReceiptResumeReference, type WorkflowScriptChildResult, type WorkflowScriptTraceEntry, type WorkflowSteerOptions, type WorkflowSteerResult } from "../../workflows/scripted-workflow.ts";
 import { executeWorkflowHostCommand, resolveWorkflowHostOutputClaimPath, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "../../workflows/host-command.ts";
-import { buildWorkflowReceipt, resolveWorkflowReceiptResumeEntry, writeWorkflowReceipt, type WorkflowReceipt, type WorkflowReceiptState } from "../../workflows/workflow-receipt.ts";
+import { buildWorkflowReceipt, readWorkflowReceipt, workflowReceiptPath, resolveWorkflowReceiptResumeEntry, writeWorkflowReceipt, type WorkflowReceipt, type WorkflowReceiptState } from "../../workflows/workflow-receipt.ts";
 import { upsertHostStep, validHostStepNodes } from "../shared/host-step-status.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
 import { parseWorkflowChildSummary, workflowChildSummary } from "../../workflows/workflow-child-summary.ts";
@@ -1744,6 +1744,28 @@ async function resumeExternalJobFollowUp(input: {
 	return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId: result.details.asyncId ?? runId, asyncDir: result.details.asyncDir ?? asyncDir, interactive: input.ctx.hasUI });
 }
 
+function resolveRequestedResumeTarget(params: SubagentParamsLike, deps: ExecutorDeps, parentSessionFile: string | null): ResumeSourceTarget | { kind: "live-nested"; target: ResolvedSubagentRunId & { kind: "nested" } } {
+	const requestedId = params.id ?? params.runId;
+	let resolved: ResolvedSubagentRunId | undefined;
+	try {
+		resolved = requestedId ? resolveSubagentRunId(requestedId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) })) : undefined;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "";
+		const asyncMatches = message.match(/async:/g)?.length ?? 0;
+		if (!isResumeAmbiguity(error) || !message.includes("foreground:") || asyncMatches !== 1) throw error;
+	}
+	if (resolved?.kind === "nested") {
+		if (params.chain?.length) throw new Error("Attaching a running subagent as a chain root is currently available for top-level async runs only.");
+		if (resolved.match.run.state === "running" || resolved.match.run.state === "queued") return { kind: "live-nested", target: resolved };
+		const trustedSessionRoots = [
+			...(deps.config.defaultSessionDir ? [path.resolve(deps.expandTilde(deps.config.defaultSessionDir))] : []),
+			...(parentSessionFile ? [deps.getSubagentSessionRoot(parentSessionFile)] : []),
+		];
+		return resolveNestedResumeTarget(resolved, trustedSessionRoots);
+	}
+	return resolveResumeTarget(params, deps.state, { asyncRequireSessionFile: false });
+}
+
 async function resumeAsyncRun(input: {
 	params: SubagentParamsLike;
 	requestCwd: string;
@@ -1782,34 +1804,9 @@ async function resumeAsyncRun(input: {
 	let target: ResumeSourceTarget;
 	const parentSessionFile = input.ctx.sessionManager.getSessionFile() ?? null;
 	try {
-		const requestedId = input.params.id ?? input.params.runId;
-		let resolved: ResolvedSubagentRunId | undefined;
-		try {
-			resolved = requestedId ? resolveSubagentRunId(requestedId, omitUndefinedProperties({ state: input.deps.state, nested: nestedResolutionScopeForExecutor(input.deps) })) : undefined;
-		} catch (error) {
-			const message = error instanceof Error ? error.message : "";
-			const asyncMatches = message.match(/async:/g)?.length ?? 0;
-			if (!isResumeAmbiguity(error) || !message.includes("foreground:") || asyncMatches !== 1) throw error;
-		}
-		if (resolved?.kind === "nested") {
-			if (attachChain) {
-				return {
-					content: [{ type: "text", text: "Attaching a running subagent as a chain root is currently available for top-level async runs only." }],
-					isError: true,
-					details: { mode: "management", results: [] },
-				};
-			}
-			if (resolved.match.run.state === "running" || resolved.match.run.state === "queued") {
-				return resumeLiveNestedRun({ target: resolved, message: followUp });
-			}
-			const trustedSessionRoots = [
-				...(input.deps.config.defaultSessionDir ? [path.resolve(input.deps.expandTilde(input.deps.config.defaultSessionDir))] : []),
-				...(parentSessionFile ? [input.deps.getSubagentSessionRoot(parentSessionFile)] : []),
-			];
-			target = resolveNestedResumeTarget(resolved, trustedSessionRoots);
-		} else {
-			target = resolveResumeTarget(input.params, input.deps.state, { asyncRequireSessionFile: false });
-		}
+		const resolved = resolveRequestedResumeTarget(input.params, input.deps, parentSessionFile);
+		if (resolved.kind === "live-nested") return resumeLiveNestedRun({ target: resolved.target, message: followUp });
+		target = resolved;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
@@ -4265,8 +4262,6 @@ function workflowChildResult(
 	}
 	const requestedContext = childParams.context === "fresh" || childParams.context === "fork" ? childParams.context : undefined;
 	const resolvedContext = result.details.context ?? (resolvedContexts.length === 1 ? resolvedContexts[0] : resolvedContexts.length > 1 ? "mixed" : undefined);
-	const resumeSourceRunId = typeof childParams.resume === "string" && childParams.resume.trim() ? childParams.resume.trim() : undefined;
-	const continuationRunIds = [...new Set([resumeSourceRunId, runId].filter((value): value is string => Boolean(value)))];
 	const outputReference = result.details.results.find((child) => child.savedOutputPath)?.savedOutputPath
 		?? result.details.results.find((child) => child.outputReference?.path)?.outputReference?.path;
 	const outputPathMapping = typeof childParams.task === "string" ? outputPathMappingFromTask(childParams.task, outputReference) : undefined;
@@ -4299,7 +4294,7 @@ function workflowChildResult(
 		...(outputPathMapping ? { outputPathMapping } : {}),
 		...(externalAdapter ? { externalAdapter } : {}),
 		resumability,
-		continuation: { runIds: continuationRunIds },
+		continuation: { runIds: runId ? [runId] : [] },
 		artifactPaths: [...artifactPaths],
 		results: result.details.results,
 	};
@@ -4412,10 +4407,33 @@ function missingWorkflowReceiptResumeHint(reference: WorkflowReceiptResumeRefere
 	}
 }
 
-function resolveKeyedWorkflowResume(
-	reference: WorkflowReceiptResumeReference,
-	state: SubagentState,
-): { runId: string; runIds: string[] } {
+function resolveWorkflowResume(
+	reference: WorkflowReceiptResumeReference | string,
+	deps: ExecutorDeps,
+	parentSessionFile: string | null,
+	index?: number,
+): string | { runId: string; runIds: string[] } {
+	const state = deps.state;
+	if (typeof reference === "string") {
+		const target = resolveRequestedResumeTarget({ id: reference.trim(), ...(index !== undefined ? { index } : {}) }, deps, parentSessionFile);
+		// Live routing stays with action=resume and does not claim retained lineage.
+		if (target.kind !== "revive") return reference.trim();
+		const runId = target.runId;
+		const status = target.source === "async" && target.asyncDir ? readStatus(target.asyncDir) : undefined;
+		if (status?.runId === runId && status.parentWorkflowRunId && status.workflowKey) {
+			// Only follow the validated child's recorded owner; never search other workflows.
+			const receiptPath = workflowReceiptPath(DIRS.async, status.parentWorkflowRunId);
+			try {
+				fs.statSync(receiptPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return { runId, runIds: [runId] };
+				throw error;
+			}
+			const entry = readWorkflowReceipt(DIRS.async, status.parentWorkflowRunId).entries[status.workflowKey];
+			if (entry?.latestRunId === runId) return { runId, runIds: entry.continuation.runIds };
+		}
+		return { runId, runIds: [runId] };
+	}
 	try {
 		const entry = resolveWorkflowReceiptResumeEntry({
 			reference,
@@ -5468,7 +5486,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								return child;
 							},
 							status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession, workflowParentModel)),
-							resolveResume: (reference) => resolveKeyedWorkflowResume(reference, deps.state),
+							resolveResume: (reference, _signal, index) => resolveWorkflowResume(reference, deps, ctx.sessionManager.getSessionFile() ?? null, index),
 							steer: (key, message, options, workflowSignal) => steerWorkflowChildByKey({ state: deps.state, workflowRunId, key, message, options, signal: workflowSignal, resolveRunId: () => workflowChildRunIds.get(key) }),
 						});
 						const finalPreflightWarnings = workflowPreflightWarnings(workflowPreflight, workflow.trace, { settled: true });
@@ -5683,7 +5701,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						return child;
 					},
 					status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession, workflowParentModel)),
-					resolveResume: (reference) => resolveKeyedWorkflowResume(reference, deps.state),
+					resolveResume: (reference, _signal, index) => resolveWorkflowResume(reference, deps, ctx.sessionManager.getSessionFile() ?? null, index),
 					steer: (key, message, options, workflowSignal) => steerWorkflowChildByKey({ state: deps.state, workflowRunId: foregroundWorkflowRunId, key, message, options, signal: workflowSignal, resolveRunId: () => workflowChildRunIds.get(key) }),
 				});
 				const finalPreflightWarnings = workflowPreflightWarnings(workflowPreflight, workflow.trace, { settled: true });

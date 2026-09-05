@@ -1628,14 +1628,16 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			const challengeOutput = relative ? "challenge-relative.md" : path.join(tempDir, "challenge-absolute.md");
 			mockPi.onCall({ output: "original writer report" });
 			mockPi.onCall({ output: "retained challenge report" });
+			mockPi.onCall({ output: "repeated challenge report" });
 			const result = await makeExecutor([makeAgent("echo")], {}, true).execute(
 				`workflow-retained-output-${relative}`,
 				{
 					async: false,
 					workflowScript: `
 						const writer = await runs.run("writer", { agent: "echo", task: "Write report", acceptance: false, output: ${JSON.stringify(writerPath)} });
-						const challenge = await runs.run("challenge", { resume: writer.runId, task: "Challenge report", output: ${JSON.stringify(challengeOutput)} });
-						return { writer, challenge };
+						const challenge = await runs.run("challenge", { resume: ${relative ? "writer.runId.slice(0, 12)" : "writer.runId"}, task: "Challenge report", output: ${JSON.stringify(challengeOutput)} });
+						const repeated = await runs.run("repeated", { resume: challenge.runId, task: "Challenge again", output: false });
+						return { writer, challenge, repeated };
 					`,
 				},
 				new AbortController().signal,
@@ -1644,9 +1646,16 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			);
 
 			assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
-			const { writer, challenge } = result.details.workflow?.value as { writer: { ok: boolean; runId: string; outputReference: string }; challenge: { ok: boolean; runId: string; outputReference: string } };
+			const { writer, challenge, repeated } = result.details.workflow?.value as Record<string, { ok: boolean; runId: string; outputReference: string; continuation: { runIds: string[] } }>;
 			assert.equal(writer.ok, true);
 			assert.equal(challenge.ok, true);
+			assert.equal(repeated.ok, true);
+			assert.deepEqual(challenge.continuation.runIds, [writer.runId, challenge.runId]);
+			assert.deepEqual(repeated.continuation.runIds, [writer.runId, challenge.runId, repeated.runId]);
+			for (const child of [writer, challenge, repeated]) {
+				const entry = Object.values(result.details.workflow!.receipt!.entries).find((entry) => entry.latestRunId === child.runId);
+				assert.deepEqual(entry?.continuation, child.continuation);
+			}
 			assert.notEqual(challenge.runId, writer.runId);
 			assert.equal(writer.outputReference, writerPath);
 			const challengePath = relative ? path.join(TEMP_ARTIFACTS_DIR, "outputs", `workflow-retained-output-${relative}`, challengeOutput) : challengeOutput;
@@ -1654,9 +1663,95 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			assert.notEqual(challenge.outputReference, writer.outputReference);
 			assert.equal(fs.readFileSync(writer.outputReference, "utf-8"), "original writer report");
 			assert.equal(fs.readFileSync(challenge.outputReference, "utf-8"), "retained challenge report");
-			assert.deepEqual(result.details.results.map((child) => child.savedOutputPath), [writerPath, challengePath]);
+			assert.deepEqual(result.details.results.map((child) => child.savedOutputPath), [writerPath, challengePath, undefined]);
 		}
-		assert.equal(mockPi.callCount(), 4);
+		assert.equal(mockPi.callCount(), 6);
+	});
+
+	it("preserves string resume lineage from the recorded terminal workflow receipt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "writer" });
+		mockPi.onCall({ output: "challenge" });
+		mockPi.onCall({ output: "repeated" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const started = await executor.execute("lineage-source", {
+			async: true,
+			workflowScript: `
+				const writer = await runs.run("writer", { agent: "echo", task: "Write", async: false, acceptance: false, output: false });
+				const challenge = await runs.run("challenge", { resume: writer.runId, task: "Challenge", output: false });
+				return { writer, challenge };
+			`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(started.isError, undefined);
+		const resultPath = path.join(DIRS.results, `${started.details.asyncId}.json`);
+		for (let attempt = 0; attempt < 500 && !fs.existsSync(resultPath); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		const settled = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+		const { writer, challenge } = settled.workflow.value;
+		assert.equal(challenge.ok, true);
+		assert.deepEqual(challenge.continuation.runIds, [writer.runId, challenge.runId]);
+		assert.deepEqual(settled.workflowReceipt.receipt.entries.challenge.continuation, challenge.continuation);
+		const repeated = await executor.execute("lineage-repeated", {
+			async: false,
+			workflowScript: `return runs.run("repeated", { resume: ${JSON.stringify(challenge.runId)}, task: "Repeat challenge", output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(repeated.isError, undefined, repeated.content[0]?.text);
+		const child = repeated.details.workflow!.value as { runId: string; continuation: { runIds: string[] } };
+		assert.deepEqual(child.continuation.runIds, [writer.runId, challenge.runId, child.runId]);
+		assert.deepEqual(repeated.details.workflow!.receipt!.entries.repeated.continuation, child.continuation);
+
+		// A recorded but malformed receipt is not the same as an absent older receipt.
+		fs.writeFileSync(settled.workflowReceipt.path, "{broken");
+		const rejected = await executor.execute("lineage-malformed", {
+			async: false,
+			workflowScript: `return runs.run("rejected", { resume: ${JSON.stringify(challenge.runId)}, task: "Do not launch", output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(rejected.isError, true);
+		assert.match(rejected.content[0]?.text ?? "", /could not be read/);
+		assert.deepEqual(rejected.details.workflow!.receipt!.entries.rejected.continuation.runIds, []);
+		assert.equal(mockPi.callCount(), 3);
+		for (const evidence of ["missing", "mismatched"]) {
+			if (evidence === "missing") fs.rmSync(settled.workflowReceipt.path);
+			else {
+				const receipt = settled.workflowReceipt.receipt;
+				receipt.entries.challenge.latestRunId = "unrelated-run";
+				receipt.entries.challenge.continuation.runIds = ["unrelated-run"];
+				fs.writeFileSync(settled.workflowReceipt.path, JSON.stringify(receipt));
+			}
+			mockPi.onCall({ output: "continued without older evidence" });
+			const fallback = await executor.execute(`lineage-${evidence}`, {
+				async: false,
+				workflowScript: `return runs.run("fallback", { resume: ${JSON.stringify(challenge.runId)}, task: "Continue", output: false });`,
+			}, new AbortController().signal, undefined, ctx);
+			assert.equal(fallback.isError, undefined, fallback.content[0]?.text);
+			const continued = fallback.details.workflow!.value as { runId: string; continuation: { runIds: string[] } };
+			assert.deepEqual(continued.continuation.runIds, [challenge.runId, continued.runId]);
+			assert.deepEqual(fallback.details.workflow!.receipt!.entries.fallback.continuation, continued.continuation);
+		}
+		assert.equal(mockPi.callCount(), 5);
+	});
+
+	it("rejects missing and stale string resume IDs without claiming continuation lineage", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "writer" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const first = await executor.execute("lineage-stale-source", {
+			async: false,
+			workflowScript: `return runs.run("writer", { agent: "echo", task: "Write", acceptance: false, output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(first.isError, undefined);
+		const writer = first.details.workflow!.value as { runId: string; results: Array<{ sessionFile: string }> };
+		fs.rmSync(writer.results[0].sessionFile);
+		for (const id of ["missing-retained-run", writer.runId]) {
+			const rejected = await executor.execute("lineage-rejected", {
+				async: false,
+				workflowScript: `return runs.run("rejected", { resume: ${JSON.stringify(id)}, task: "Do not launch" });`,
+			}, new AbortController().signal, undefined, ctx);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0]?.text ?? "", /not found|does not exist/);
+			assert.equal(rejected.details.workflow!.receipt!.entries.rejected.latestRunId, undefined);
+			assert.deepEqual(rejected.details.workflow!.receipt!.entries.rejected.continuation.runIds, []);
+		}
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("applies explicit structured-output contract fields when resuming a foreground workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

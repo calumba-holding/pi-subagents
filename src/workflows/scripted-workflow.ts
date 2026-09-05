@@ -1110,7 +1110,7 @@ export interface RunWorkflowScriptOptions {
 	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
-	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
+	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
 	host?: (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult>;
@@ -2183,10 +2183,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const childStopController = new AbortController();
 				childStopControllers.set(key, childStopController);
 				const childSignal = combinedAbortSignal([childController.signal, childStopController.signal]);
-				const resolvedResumeValue = resumeReference
+				const resumeInput = resumeReference ?? (typeof params.resume === "string" && options.resolveResume ? params.resume : undefined);
+				const resolvedResumeValue = resumeInput
 					? await Promise.resolve().then(() => {
 						if (!options.resolveResume) throw new Error("Keyed workflow receipt resume is unavailable in this host.");
-						return options.resolveResume(resumeReference, childSignal);
+						return options.resolveResume(resumeInput, childSignal, typeof params.index === "number" ? params.index : undefined);
 					})
 					: undefined;
 				const resolvedResume = typeof resolvedResumeValue === "string"
@@ -2202,6 +2203,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						: [];
 					resolvedResumeLineage = [...new Set(lineage.length ? lineage : [resolvedResumeId!])];
 					if (resolvedResumeLineage.at(-1) !== resolvedResumeId) resolvedResumeLineage.push(resolvedResumeId!);
+					if (typeof resumeInput === "string") {
+						const predecessor = [...children.values()].find((child) => child.runId === resolvedResumeId);
+						if (predecessor?.continuation && predecessor.continuation.runIds.at(-1) === resolvedResumeId) resolvedResumeLineage = predecessor.continuation.runIds;
+					}
 				}
 				const launchParams = resolvedResumeId ? { ...params, resume: resolvedResumeId } : params;
 				await launchSemaphore.acquire();
