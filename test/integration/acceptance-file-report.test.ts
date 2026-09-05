@@ -132,7 +132,7 @@ async function waitForAsyncResult(id: string, timeoutMs = 15_000): Promise<Async
 // Diagnostic only: retaining ChildProcess objects may perturb observer lifetime.
 // Neither callbacks nor these projections authorize cleanup.
 const ownedRunners = new Map<string, ReturnType<typeof observeRunner>>();
-function observeRunner(id: string, bodyStartedAt: number) {
+function observeRunner(id: string, bodyStartedAt: number, disableCompileCache: boolean) {
 	const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 	const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
 	const known = (value: unknown, values: string[]) => typeof value === "string" && values.includes(value) ? value : undefined;
@@ -244,12 +244,18 @@ public static class AcceptanceIdentity {
 		},
 		launch(run: () => unknown) {
 			const nodeOptions = process.env.NODE_OPTIONS;
+			const previousDisableCompileCache = process.env.NODE_DISABLE_COMPILE_CACHE;
 			diagnosticChannel.subscribe(onProcess);
 			try {
 				process.env.NODE_OPTIONS = `${nodeOptions ?? ""} --trace-exit`;
+				if (disableCompileCache) process.env.NODE_DISABLE_COMPILE_CACHE = "1";
 				return run();
 			}
 			finally {
+				if (disableCompileCache) {
+					if (previousDisableCompileCache === undefined) delete process.env.NODE_DISABLE_COMPILE_CACHE;
+					else process.env.NODE_DISABLE_COMPILE_CACHE = previousDisableCompileCache;
+				}
 				if (nodeOptions === undefined) delete process.env.NODE_OPTIONS;
 				else process.env.NODE_OPTIONS = nodeOptions;
 				marks.launchFinishedAt = Date.now();
@@ -257,58 +263,60 @@ public static class AcceptanceIdentity {
 				for (const entry of processes) if (pid === undefined || entry.proc.pid !== pid) entry.dispose();
 			}
 		},
+		readEvidence(file: string, kind: "json" | "phases" | "journal" = "json") {
+			const matched = processes.filter(({ proc }) => pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && proc.pid === pid);
+			const readAt = Date.now();
+			try {
+				const fd = fs.openSync(file, "r");
+				try {
+					const size = fs.fstatSync(fd).size;
+					const limit = kind === "phases" ? 8192 : 65536;
+					if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
+					const offset = kind === "json" ? 0 : Math.max(0, size - limit);
+					const buffer = Buffer.alloc(Math.min(size, limit));
+					const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+					const text = buffer.toString("utf-8", 0, bytes);
+					const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
+					if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
+					const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
+					const entries: unknown[] = [];
+					let parseErrors = 0;
+					for (const line of lines.filter(Boolean)) {
+						if (kind === "phases") {
+							if (matched.length !== 1) continue;
+							// Native Environment::Exit follows AtExit, precedes shutdown, and has no timestamp.
+							const trace = /^\(node:(\d{1,16})\) WARNING: Exited the environment with code (-?\d{1,10})\r?$/.exec(line);
+							if (trace && Number(trace[1]) === pid) {
+								entries.push({ phase: "native-trace-exit", pid, code: Number(trace[2]) });
+								continue;
+							}
+							const runtime = /^#1916 runtime node=(v\d{1,3}\.\d{1,3}\.\d{1,3}) uv=(\d{1,3}\.\d{1,3}\.\d{1,3}) cacheEnabled=(true|false|unavailable) pid=(\d{1,16})$/.exec(line);
+							if (runtime && Number(runtime[4]) === pid) {
+								entries.push({ phase: "runtime", node: runtime[1], uv: runtime[2], cacheEnabled: runtime[3] === "unavailable" ? "unavailable" : runtime[3] === "true", pid });
+								continue;
+							}
+							const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit|exit-request|exit-dispatch-return|exit-dispatch-throw) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
+							if (!match) continue;
+							const [invocation, ts, markerPid] = match.slice(2).map(Number);
+							if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
+							if (match[1]!.startsWith("exit") ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
+							entries.push({ phase: match[1], invocation, ts, pid: markerPid });
+						} else {
+							try {
+								const event = record(JSON.parse(line));
+								const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
+								if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
+							} catch { parseErrors++; }
+						}
+					}
+					return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
+				} finally { fs.closeSync(fd); }
+			} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
+		},
 		snapshot(proof: unknown) {
 			const snapshotAt = Date.now();
 			const matched = processes.filter(({ proc }) => pid !== undefined && Number.isSafeInteger(pid) && pid > 0 && proc.pid === pid);
-			const read = (file: string, kind: "json" | "phases" | "journal" = "json") => {
-				const readAt = Date.now();
-				try {
-					const fd = fs.openSync(file, "r");
-					try {
-						const size = fs.fstatSync(fd).size;
-						const limit = kind === "phases" ? 8192 : 65536;
-						if (kind === "json" && size > limit) return { readAt, size, io: "oversized", truncated: true };
-						const offset = kind === "json" ? 0 : Math.max(0, size - limit);
-						const buffer = Buffer.alloc(Math.min(size, limit));
-						const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
-						const text = buffer.toString("utf-8", 0, bytes);
-						const base = { readAt, size, bytes, io: "readable", truncated: offset > 0 };
-						if (kind === "json") return { ...base, ...project(JSON.parse(text)) };
-						const lines = text.split("\n").slice(offset > 0 ? 1 : 0);
-						const entries: unknown[] = [];
-						let parseErrors = 0;
-						for (const line of lines.filter(Boolean)) {
-							if (kind === "phases") {
-								if (matched.length !== 1) continue;
-								// Native Environment::Exit follows AtExit, precedes shutdown, and has no timestamp.
-								const trace = /^\(node:(\d{1,16})\) WARNING: Exited the environment with code (-?\d{1,10})\r?$/.exec(line);
-								if (trace && Number(trace[1]) === pid) {
-									entries.push({ phase: "native-trace-exit", pid, code: Number(trace[2]) });
-									continue;
-								}
-								const runtime = /^#1916 runtime node=(v\d{1,3}\.\d{1,3}\.\d{1,3}) uv=(\d{1,3}\.\d{1,3}\.\d{1,3}) cacheEnabled=(true|false|unavailable) pid=(\d{1,16})$/.exec(line);
-								if (runtime && Number(runtime[4]) === pid) {
-									entries.push({ phase: "runtime", node: runtime[1], uv: runtime[2], cacheEnabled: runtime[3] === "unavailable" ? "unavailable" : runtime[3] === "true", pid });
-									continue;
-								}
-								const match = /^#1918 phase=(dispose-entry|dispose-return|dispose-rejection|exit|exit-request|exit-dispatch-return|exit-dispatch-throw) invocation=(\d{1,16}) ts=(\d{1,16}) pid=(\d{1,16})$/.exec(line);
-								if (!match) continue;
-								const [invocation, ts, markerPid] = match.slice(2).map(Number);
-								if (![invocation, ts, markerPid].every(Number.isSafeInteger) || markerPid !== pid || ts <= 0) continue;
-								if (match[1]!.startsWith("exit") ? invocation !== 0 : invocation < 1 || invocation > 8) continue;
-								entries.push({ phase: match[1], invocation, ts, pid: markerPid });
-							} else {
-								try {
-									const event = record(JSON.parse(line));
-									const type = known(event.type, ["subagent.run.started", "subagent.run.completed", "subagent.run.process_terminal"]);
-									if (type && event.runId === id) entries.push({ type, ts: number(event.ts), ...project(event), proof: project(event.processTerminal) });
-								} catch { parseErrors++; }
-							}
-						}
-						return { ...base, parseErrors, entries: entries.slice(-16), entriesTruncated: entries.length > 16 };
-					} finally { fs.closeSync(fd); }
-				} catch (error) { return { readAt, io: error instanceof SyntaxError ? "invalid-json" : errorCode(error) }; }
-			};
+			const read = this.readEvidence;
 			const asyncDir = path.join(ASYNC_DIR!, id);
 			const snapshot = {
 				id, pid, marks, notifications, lastProof: project(proof), snapshotAt,
@@ -321,6 +329,17 @@ public static class AcceptanceIdentity {
 			// One failure-only query, after the original evidence snapshot. Never cleanup authority.
 			identity ??= queryIdentity(matched.length === 1 ? matched[0]!.proc : undefined);
 			return { ...snapshot, identity };
+		},
+		measureControl(proof: unknown) {
+			if (!disableCompileCache) return;
+			try {
+				console.log("#1947 cache-disable-control " + JSON.stringify({
+					id, pid, measuredAt: Date.now(), proof: project(proof),
+					processes: processes.filter(({ proc }) => pid !== undefined && proc.pid === pid).map(({ proc, events }) => ({ pid: proc.pid, exitCode: proc.exitCode, events })),
+					phases: this.readEvidence(path.join(ASYNC_DIR!, id, "runner.stderr.log"), "phases"),
+				}));
+			}
+			catch { console.log('#1947 cache-disable-control {"measurement":"unavailable"}'); }
 		},
 		dispose() { for (const entry of processes) entry.dispose(); },
 	};
@@ -342,6 +361,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 			// The reader validates identity/shape and treats absent or partial I/O as unproven.
 			proof = readProcessTerminal(asyncDir, { runId: id });
 			if (proof?.state === "observed") {
+				diagnostic.measureControl(proof);
 				diagnostic.dispose();
 				return;
 			}
@@ -643,7 +663,7 @@ describe("acceptance file reports", { skip: !runSync ? "pi packages not availabl
 	});
 
 	describe("background runner", { skip: isAsyncAvailable && !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS) {
+		function runAsyncSingle(id: string, outputPath: string, outputMode: "inline" | "file-only", artifactConfig = DISABLED_ARTIFACTS, disableCompileCache = false) {
 			const originalFactoryModule = childSessionFactoryModule();
 			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
 			const factoryPath = path.join(tempDir, "acceptance-exit-phases.mjs");
@@ -691,7 +711,7 @@ export default function() {
   };
 }
 `);
-			const diagnostic = observeRunner(id, bodyStartedAt);
+			const diagnostic = observeRunner(id, bodyStartedAt, disableCompileCache);
 			// Register before launch so even a throwing launch cannot escape teardown ownership.
 			ownedRunners.set(id, diagnostic);
 			try {
@@ -719,7 +739,8 @@ export default function() {
 			const outputPath = path.join(tempDir, "async-report.md");
 			conflictingReportsCall(outputPath, "satisfied", "not-satisfied");
 			const id = `acceptance-file-report-${Date.now().toString(36)}`;
-			runAsyncSingle(id, outputPath, "file-only");
+			// One-variable control: only this launch disables Node's compile cache, not Jiti's transform cache.
+			runAsyncSingle(id, outputPath, "file-only", DISABLED_ARTIFACTS, true);
 
 			const payload = await waitForAsyncResult(id);
 			assert.equal(payload.success, true);
