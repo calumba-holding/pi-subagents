@@ -2,54 +2,60 @@
 
 ## [Unreleased]
 
-### Changed
-- Identify native Pi model-verification failures and point to the existing exact `modelResponseAliases` configuration remedy (#1922). Thanks to [@sixtus](https://github.com/sixtus).
-- Document the startup fallback boundary and the narrow native foreground/background read-only HTTP 429 continuation, including host-specific budget and compatibility limits (#1936). Thanks to reporter [@peedrr](https://github.com/peedrr).
-- Document steer delivery modes and `scheduledRuns.storeRoot` in the bundled skill reference (`execution-controls.md`) (#1933). Thanks to [@G0-0000](https://github.com/G0-0000).
-- Remove generation suffixes from developer-facing contract types and helpers; request shapes, format versions, and behavior are unchanged (#1913).
+## [0.66.0] - 2026-09-06
+
+### Highlights
+- Background results and completion notifications arrive more reliably, including after storage problems.
+- Steering and supervisor replies reach the right run, with clearer guidance when a reply is needed first.
+- Read-only tasks can continue after a rate limit on a compatible fallback model without starting over.
+- Live progress, transcripts, and stable status displays make ongoing work easier to follow.
+- Custom agents can opt into discovery, and trusted extensions can provide named workflows.
 
 ### Added
-- Add opt-in bounded completion delivery/suppression reason traces via `NODE_DEBUG=pi-subagents-notify` ([#1981](https://github.com/nicobailon/pi-subagents/issues/1981)). Thanks to [@brandonmwest](https://github.com/brandonmwest) for identifying the observability gap and offering instrumented sessions.
-- Allow one guarded native foreground or background read-only continuation after observed HTTP 429 on a compatible same-configured-provider fallback model, retaining the exact session without task replay and sharing the existing recovery allowance. Original deadlines and host-specific budget gates remain authoritative (#1936). Thanks to reporter [@peedrr](https://github.com/peedrr).
-- Let agents opt into parent-prompt discovery with `advertise: true`. Thanks to [@nwalke](https://github.com/nwalke) for #1972.
-- Add selective researcher source checks and explicit evidence, confidence, and uncertainty reporting (#1932). Thanks to [@Muskos](https://github.com/Muskos).
-- Let trusted extensions register session-scoped named workflows with validated arguments and exact host-command grants (#1907).
+- Let agents appear in the parent prompt with `advertise: true`. Thanks to [@nwalke](https://github.com/nwalke) for #1972.
+- Allow one read-only continuation after an HTTP 429 rate limit on a compatible fallback model from the same configured provider. Keep the session without replaying the task, within existing recovery, time, and budget limits (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Add targeted source checks and clearer evidence, confidence, and uncertainty reporting to researcher responses (#1932). Thanks to [@Muskos](https://github.com/Muskos).
+- Let trusted extensions register session-scoped named workflows with validated arguments and permission to run specific host commands (#1907).
+- Add opt-in completion notification diagnostics with `NODE_DEBUG=pi-subagents-notify` (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the report and diagnostic sessions.
+
+### Changed
+- Explain model-verification failures and how to configure exact `modelResponseAliases` (#1922). Thanks to [@sixtus](https://github.com/sixtus).
+- Clarify when startup fallback and read-only rate-limit continuation are supported (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Document steering delivery modes and `scheduledRuns.storeRoot` (#1933). Thanks to [@G0-0000](https://github.com/G0-0000).
+- Remove generation suffixes from developer-facing types and helpers without changing request shapes, saved formats, or behavior (#1913).
 
 ### Fixed
-- Retain unreadable stop requests for retry, reject workflow argument validation failures with empty error messages, and preserve worktree setup timeout causes.
-- Align native supervisor actions and reply/steer routing hints with supported routes. Thanks to [@rtbe](https://github.com/rtbe) for #2002.
-- Renew native async result delivery after visible early failure and deferred publication, without idle polling (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest).
-- Keep native child acceptance instructions verbatim in session system resources across compaction (#1996). Thanks to reporter [@Zsbyqx20](https://github.com/Zsbyqx20).
-- Publish indexed async workflow results before terminal persistence after storage-capacity recovery (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest) for reporting completion-delivery observations.
-- Refuse single async steering and follow-up when an exact live supervisor ask is known; report explicit request IDs without answering, queueing, or recovering the blocked child (#1980). Thanks to [@brandonmwest](https://github.com/brandonmwest).
-- Activate demand-gated supervisor polling when an async workflow registers, including scheduled workflows owned by the current runtime session and rearming after prior work finishes, without restoring idle Darwin timers or native watchers (#1977). Thanks to [@brandonmwest](https://github.com/brandonmwest); preserves [@youlikemodernart](https://github.com/youlikemodernart)'s #1220/#1228 idle-Darwin constraints.
-- Allow same-session steering to enqueue for recorded foreign workflows without claiming delivery or recovering the owner (#1978). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the report and proposed direction.
-- Keep unconfigured prompt-runtime loads inert. Thanks to [@lertian](https://github.com/lertian) for #1973.
-- Discover supervisor asks on demand even without a UI context, isolate notification failures, and keep answers explicit (#1975, #1982). Thanks to [@brandonmwest](https://github.com/brandonmwest).
-- Consume async workflow steering with exact child targeting, terminal shutdown receipts, and handler-selective inbox watching (#1976, #1983). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the diagnosis, Herdr reproduction, initial consumer, and tests.
-- Publish indexed background runner results before successful terminal status after storage-capacity recovery, preserving macOS completion delivery demand (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest) for reporting completion-delivery observations.
-- Return `invalid_state` instead of queuing unreachable workflow stop requests when live workflow controllers are unavailable (#1965).
-- Forward bounded live tool activity, timing, model/effort, and counters for synchronous workflow children without forwarding transcripts (#1964).
-- Allow `action: "status", view: "transcript"` to inspect bounded live foreground child artifacts on demand (#1963).
-- Keep the async status widget in place across progress updates instead of re-registering it behind other extensions' widgets (#1931). Thanks to [@DraconDev](https://github.com/DraconDev).
-- Avoid caching request-shape provider errors as unhealthy model exclusions (#1955). Thanks to [@slyons-vamp](https://github.com/slyons-vamp).
-- Wait for workflow-owned root result publication before declaring retained workflow resumes missing on Windows (#1906).
-- Recognize raw `REQUEST_LIMIT_EXCEEDED` rate limits and keep context-overflow errors out of the model exclusion cache (#1955, #1957). Thanks to [@slyons-vamp](https://github.com/slyons-vamp).
-- Emit synchronous workflow progress updates for RPC/headless and cross-repository hosts even when the live chat card is off (#1951). Thanks to [@yanqianglu](https://github.com/yanqianglu).
-- Resolve undici from the official npm registry in the lockfile for npm 12 compatibility (#1935). Thanks to [@chem](https://github.com/chem).
-- Fix background launches on stable Pi 0.85.1 without experimental packages, retaining Pi 0.85.0 support (#1944). Thanks to [@geril07](https://github.com/geril07).
-- Surface the published workflow receipt path in wait completions, notifications, and exact status/debug responses (#1938).
-- Surface structured output in completion notices when text is blank or only a closing think-tag (#1945). Thanks to [@npfedwards](https://github.com/npfedwards).
-- Validate literal workflow `baseRef` values before execution and clarify supported refs (#1934, #1937). Thanks to [@jeanduplessis](https://github.com/jeanduplessis).
-- Use portable boolean tool-schema branches for restricted Gemini function-declaration converters while preserving false-only runtime contracts (#1950). Thanks to [@Biaogo94](https://github.com/Biaogo94).
-- Keep the fleet inspector roster stable by ordering active runs by start time instead of last activity heartbeat (#1923, #1924). Thanks to [@expoli](https://github.com/expoli).
-- Preserve retained predecessor lineage in string-ID workflow continuations and receipts (#1920).
-- Clear recovered assistant errors on successful tool-use completion, including terminating structured output (#1919). Thanks to [@Jonathanm10](https://github.com/Jonathanm10).
-- Diagnose empty terminal text responses as empty-output failures rather than earlier exploratory tool errors (#1921).
-- Rescue confident read-only background completions misclassified as implementation before publishing missing-edit failures (#1911). Thanks to [@yanqianglu](https://github.com/yanqianglu).
-- Keep background streaming status updates batched during long-running and attention states while publishing child activity transitions immediately (#1901).
-- Honor distinct output paths on retained workflow follow-ups, preserving the original report and returning the saved output references (#1903).
-- Keep worktree setup responsive and cancellable while preserving uncertain allocations for manual reconciliation (#1902).
+- Deliver background results and completion notices reliably after early failures, delayed publication, or storage-capacity recovery. Save results before reporting successful completion, without adding idle polling (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Keep completion requirements intact when child sessions compact their context (#1996). Thanks to [@Zsbyqx20](https://github.com/Zsbyqx20).
+- Correct supervisor action names and reply and steering guidance. Thanks to [@rtbe](https://github.com/rtbe) for #2002.
+- Require an explicit answer to a pending supervisor question before steering or following up on a single background run; include the request ID in the response (#1980). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Detect supervisor questions when background or scheduled workflows start, including after earlier work finishes, while keeping macOS idle polling disabled (#1977). Thanks to [@brandonmwest](https://github.com/brandonmwest) and [@youlikemodernart](https://github.com/youlikemodernart) for #1220 and #1228.
+- Queue steering for workflows owned by another runtime without incorrectly claiming delivery or taking over the run (#1978). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Find supervisor questions without a UI, keep notification failures from interrupting discovery, and require explicit answers (#1975, #1982). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Deliver background workflow steering to the intended child and report requests that cannot be delivered before shutdown (#1976, #1983). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the diagnosis, reproduction, implementation, and tests.
+- Leave the prompt runtime inactive when it is not configured. Thanks to [@lertian](https://github.com/lertian) for #1973.
+- Return `invalid_state` instead of queuing stop requests that cannot reach a live workflow (#1965).
+- Retain unreadable stop requests for retry, reject invalid workflow arguments even when validation returns an empty error message, and preserve worktree timeout details.
+- Show live tool activity, timing, model, effort, and counters for foreground workflow children without forwarding full transcripts (#1964).
+- Allow `action: "status", view: "transcript"` to inspect live foreground child output on demand (#1963).
+- Keep the background status widget in place during progress updates (#1931). Thanks to [@DraconDev](https://github.com/DraconDev).
+- Recognize `REQUEST_LIMIT_EXCEEDED` rate limits and avoid excluding healthy models because of invalid requests or context overflow (#1955, #1957). Thanks to [@slyons-vamp](https://github.com/slyons-vamp).
+- Wait for resumed workflow results to be saved before reporting them missing on Windows (#1906).
+- Send foreground workflow progress to RPC, headless, and cross-repository hosts even when the live chat card is off (#1951). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Resolve undici from the official npm registry for npm 12 compatibility (#1935). Thanks to [@chem](https://github.com/chem).
+- Fix background launches on stable Pi 0.85.1 without experimental packages, while retaining Pi 0.85.0 support (#1944). Thanks to [@geril07](https://github.com/geril07).
+- Include the saved workflow receipt path in wait results, notifications, and status and debug responses (#1938).
+- Show structured output in completion notices when text is blank or contains only a closing think-tag (#1945). Thanks to [@npfedwards](https://github.com/npfedwards).
+- Validate workflow `baseRef` values before execution and clarify supported refs (#1934, #1937). Thanks to [@jeanduplessis](https://github.com/jeanduplessis).
+- Make boolean tool options compatible with restricted Gemini schema converters without changing which values are accepted (#1950). Thanks to [@Biaogo94](https://github.com/Biaogo94).
+- Keep Fleet runs in start-time order instead of reshuffling them as activity changes (#1923, #1924). Thanks to [@expoli](https://github.com/expoli).
+- Preserve links to previous runs when continuing a workflow by its string ID (#1920).
+- Clear recovered errors after successful tool use or structured output (#1919). Thanks to [@Jonathanm10](https://github.com/Jonathanm10).
+- Report empty final responses as empty-output failures instead of blaming earlier tool errors (#1921).
+- Avoid missing-edit failures for successful read-only background tasks misclassified as implementation work (#1911). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Batch background streaming updates while showing child activity changes immediately (#1901).
+- Honor new output paths on workflow follow-ups without overwriting the original report (#1903).
+- Keep worktree setup responsive and cancellable, and preserve uncertain allocations for manual inspection (#1902).
 
 ## [0.65.1] - 2026-09-04
 
