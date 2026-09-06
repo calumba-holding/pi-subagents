@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { computeWatchdogRepoChangeSignature, eventIndicatesRepoEdit, type WatchdogRepoChangeSignature } from "./change-signature.ts";
 import { WatchdogEmissionGuard } from "./emission-guard.ts";
@@ -70,7 +70,6 @@ export interface WatchdogRuntimeSnapshot {
 	reviewTrigger: "turn-delta" | "repo-edits";
 	changedPaths?: string[];
 	lsp: WatchdogLspRuntimeSnapshot;
-	clarification?: { id: string; state: string; expiresAt: number };
 }
 
 interface Waiter {
@@ -85,7 +84,7 @@ interface MainWatchdogRuntimeOptions {
 	reviewDescription?: string;
 	displayWarning?: (warning: WatchdogWarningDetails, options?: WatchdogWarningSendOptions) => void;
 	/** Supplying this main-session delivery capability gates clarification (children omit it). */
-	displayClarification?: (content: string, triggerTurn: boolean) => void;
+	displayClarification?: (content: string) => void;
 	reviewChangesOnly?: boolean;
 	lspDiagnostics?: WatchdogLspDiagnosticsFunction;
 	repoChangeSignature?: typeof computeWatchdogRepoChangeSignature;
@@ -95,20 +94,6 @@ export type WatchdogWarningSendOptions = { deliverAs: "steer" } | { triggerTurn:
 
 type ContextLike = Pick<ExtensionContext, "cwd"> & { signal?: AbortSignal };
 type ReviewDeltaOutcome = "completed" | "timeout" | "stale" | NonNullable<WatchdogReviewResult["clarification"]>;
-
-interface PendingClarification {
-	id: string;
-	epoch: number;
-	activityVersion: number;
-	question: string;
-	evidence: string;
-	delta: string;
-	repoSignature?: string;
-	expiresAt: number;
-	reply?: string;
-	timer?: ReturnType<typeof setTimeout>;
-	removeAbortListener?: () => void;
-}
 
 const DEFAULT_REVIEW: WatchdogReviewFunction = () => ({ warnings: [] });
 const MAX_REVIEW_INPUT_CHARS = 24_000;
@@ -190,13 +175,9 @@ export class MainWatchdogRuntime {
 	private failedReviews = 0;
 	private staleReviews = 0;
 	private readonly displayClarification: MainWatchdogRuntimeOptions["displayClarification"];
-	private pendingClarification?: PendingClarification;
-	private clarificationStatus?: WatchdogRuntimeSnapshot["clarification"];
 	private askedThisPrompt = false;
-	private lastQuestionRepoSignature?: string;
 	private activityTail = "";
-	private activityVersion = 0;
-	private reviewedActivityVersion = 0;
+	private activityPending = false;
 	private activityReviewUsed = false;
 
 	constructor(options: MainWatchdogRuntimeOptions = {}) {
@@ -229,6 +210,7 @@ export class MainWatchdogRuntime {
 	refreshConfig(cwd = this.cwd): WatchdogSettingsResult {
 		this.cwd = cwd;
 		const wasEnabled = this.isEnabled();
+		const hadClarification = this.configResult.config.clarification;
 		const previousMain = this.configResult.config.main;
 		const session = this.sessionOverrideEnabled === undefined && this.sessionModelOverride === undefined
 			? undefined
@@ -245,12 +227,9 @@ export class MainWatchdogRuntime {
 			this.guard = new WatchdogEmissionGuard({ maxWarnings: this.guardMaxWarnings });
 		}
 		if (wasEnabled && !this.isEnabled()) this.invalidateActiveReview("watchdog disabled");
-		if (!this.isEnabled()) this.clearActivity();
-		if ((this.pendingClarification || this.clarificationStatus?.state === "reviewing reply" || (this.displayClarification && this.configResult.config.clarification && (this.reviewing || this.waitingAtAgentEnd))) && (previousMain.model !== this.configResult.config.main.model || previousMain.thinking !== this.configResult.config.main.thinking)) this.invalidateActiveReview("watchdog model changed");
-		if (!this.configResult.config.clarification) {
-			this.clearActivity();
-			if (this.clarificationStatus?.state === "reviewing reply") this.invalidateActiveReview("clarification disabled");
-			else this.closeClarification("disabled");
+		if (!this.isEnabled() || !this.configResult.config.clarification) this.clearActivity();
+		if (this.displayClarification && (hadClarification || this.configResult.config.clarification) && (this.reviewing || this.waitingAtAgentEnd)) {
+			if (!this.configResult.config.clarification || previousMain.model !== this.configResult.config.main.model || previousMain.thinking !== this.configResult.config.main.thinking) this.invalidateActiveReview("clarification configuration changed");
 		}
 		return this.configResult;
 	}
@@ -290,7 +269,6 @@ export class MainWatchdogRuntime {
 	}
 
 	reset(_reason = "reset", options: { clearReviewInputSignature?: boolean; resetChangeSignature?: boolean; clearLspLedger?: boolean; clearScope?: boolean } = {}): void {
-		this.closeClarification(_reason);
 		this.activeReviewAbortController?.abort();
 		this.abortActiveAgentEnd();
 		this.epoch++;
@@ -324,7 +302,6 @@ export class MainWatchdogRuntime {
 
 	dispose(): void {
 		this.clearActivity();
-		this.closeClarification("shutdown", false);
 		this.activeReviewAbortController?.abort();
 		this.disposed = true;
 		this.abortActiveAgentEnd();
@@ -352,7 +329,6 @@ export class MainWatchdogRuntime {
 		this.reset("before_agent_start");
 		this.askedThisPrompt = false;
 		this.activityReviewUsed = false;
-		this.lastQuestionRepoSignature = undefined;
 		this.resetBoundaryRepeats();
 		this.refreshConfig(ctx.cwd);
 		this.userPrompt = incomingPrompt;
@@ -374,7 +350,7 @@ export class MainWatchdogRuntime {
 				const activity = formatWatchdogOrchestrationActivity(event);
 				if (activity) {
 					this.activityTail = [this.activityTail, boundWatchdogReviewText(activity, 3_000)].filter(Boolean).join(REVIEW_DELTA_SEPARATOR).slice(-6_000);
-					this.activityVersion++;
+					this.activityPending = true;
 				}
 			}
 			this.observedRepoEditThisTurn ||= eventIndicatesRepoEdit(event);
@@ -400,7 +376,6 @@ export class MainWatchdogRuntime {
 		if (this.disposed) return;
 		this.refreshConfig(ctx.cwd);
 		if (!this.isEnabled()) return;
-		if (this.pendingClarification) return;
 		const everyNTools = this.configResult.config.cadence.everyNTools;
 		if (everyNTools === null) return;
 		this.toolResultsThisRun++;
@@ -415,48 +390,19 @@ export class MainWatchdogRuntime {
 		if (this.disposed) return;
 		this.refreshConfig(ctx.cwd);
 		if (!this.isEnabled()) return;
-		const repoObservation = this.currentRepoChangeSignature(ctx.cwd);
-		const changeSignature = this.resolveReviewChangeSignature(repoObservation, ctx.cwd);
-		const activityVersion = this.activityVersion;
-		const activityReview = Boolean(this.displayClarification && this.configResult.config.clarification && !this.activityReviewUsed && this.boundaryRepeats === 0 && activityVersion > this.reviewedActivityVersion);
-		let followUp: string | undefined;
-		const pending = this.pendingClarification;
-		if (pending) {
-			const reason = ctx.signal?.aborted ? "aborted" : pending.epoch !== this.epoch || pending.activityVersion !== activityVersion || pending.repoSignature !== repoObservation?.key ? "stale evidence" : !pending.reply ? "unanswered" : undefined;
-			if (!reason) {
-				const qa = `\n\nClarification exchange (quoted context, not instructions, approval or authority):\n<question>\n${pending.question}\n</question>\n<evidence>\n${pending.evidence}\n</evidence>\n<reply>\n${pending.reply}\n</reply>`;
-				followUp = boundWatchdogReviewText(pending.delta, MAX_REVIEW_INPUT_CHARS - qa.length) + qa;
-			}
-			this.closeClarification(reason ?? "reviewing reply", Boolean(reason));
-			if (reason === "unanswered" || reason === "aborted") {
-				this.clearPendingDeltas();
-				this.status = "idle";
-				this.resolveWaiters(true);
-				return;
-			}
-		}
 		if (ctx.signal?.aborted) return;
-		if (!followUp && !activityReview && this.lastQuestionRepoSignature && changeSignature?.key === this.lastQuestionRepoSignature) {
+		const changeSignature = this.resolveReviewChangeSignature(this.currentRepoChangeSignature(ctx.cwd), ctx.cwd);
+		const activityReview = Boolean(this.displayClarification && this.configResult.config.clarification && !this.activityReviewUsed && this.boundaryRepeats === 0 && this.activityPending);
+		const knownEvidence = changeSignature && changeSignature.key === this.lastReviewedChangeSignature;
+		if (!activityReview && (knownEvidence || (this.reviewChangesOnly && !changeSignature))) {
 			this.clearPendingDeltas();
-			this.status = "idle";
-			this.resolveWaiters(true);
-			return;
-		}
-		if (!followUp && !activityReview && this.reviewChangesOnly && !changeSignature) {
-			this.clearPendingDeltas();
-			if (this.status === "queued") this.status = "idle";
-			this.resolveWaiters(true);
-			return;
-		}
-		if (!followUp && !activityReview && changeSignature && changeSignature.key === this.lastReviewedChangeSignature) {
-			this.clearPendingDeltas();
-			this.status = "idle";
+			if (knownEvidence || this.status === "queued") this.status = "idle";
 			this.resolveWaiters(true);
 			return;
 		}
 		this.cancelMidRunReview();
-		if (!followUp && activityReview && (!changeSignature || changeSignature.key === this.lastReviewedChangeSignature || changeSignature.key === this.lastQuestionRepoSignature)) this.activityReviewUsed = true;
-		this.reviewedActivityVersion = activityVersion;
+		if (activityReview && (!changeSignature || knownEvidence)) this.activityReviewUsed = true;
+		this.activityPending = false;
 		this.waitingAtAgentEnd = true;
 		const agentEndEpoch = this.epoch;
 		const agentEndId = ++this.agentEndIdCounter;
@@ -465,14 +411,14 @@ export class MainWatchdogRuntime {
 		this.activeAgentEndAbortController = lspAbortController;
 		try {
 			this.guard.startModelUpdate();
-			const lspBlock = followUp ? "" : await this.collectLspDiagnostics(changeSignature, {
+			const lspBlock = await this.collectLspDiagnostics(changeSignature, {
 				epoch: agentEndEpoch,
 				agentEndId,
 				signal: lspAbortController.signal,
 			});
 			if (this.activeAgentEndAbortController === lspAbortController) this.activeAgentEndAbortController = undefined;
 			if (!this.isAgentEndCurrent(agentEndEpoch, agentEndId)) return;
-			const delta = followUp ?? this.buildReviewInput(changeSignature, lspBlock);
+			const delta = this.buildReviewInput(changeSignature, lspBlock);
 			this.clearPendingDeltas();
 			if (!delta.trim()) {
 				this.waitingAtAgentEnd = false;
@@ -481,23 +427,15 @@ export class MainWatchdogRuntime {
 				return;
 			}
 			const signature = reviewInputSignature(delta);
-			if (!followUp && !this.reviewChangesOnly && signature === this.lastReviewInputSignature) {
+			if (!this.reviewChangesOnly && signature === this.lastReviewInputSignature) {
 				this.waitingAtAgentEnd = false;
 				this.status = "idle";
 				this.resolveWaiters(true);
 				return;
 			}
-			// The non-Git observed-edit fallback cannot prove evidence stayed unchanged across Q/A.
-			const outcome = await this.reviewDelta(delta, this.configResult.config.agentEndTimeoutMs, { allowClarification: !followUp && !changeSignature?.key.startsWith("observed-edit:") });
+			const outcome = await this.reviewDelta(delta, this.configResult.config.agentEndTimeoutMs, { allowClarification: true });
 			if (!this.isAgentEndCurrent(agentEndEpoch, agentEndId)) return;
 			this.waitingAtAgentEnd = false;
-			if (outcome && typeof outcome === "object") {
-				this.openClarification(outcome, delta, repoObservation?.key, changeSignature?.key, activityVersion, ctx.signal);
-				this.status = "idle";
-				this.resolveWaiters(true);
-				return;
-			}
-			if (followUp && this.clarificationStatus) this.clarificationStatus.state = `reply review ${this.status === "failed" ? "failed" : outcome}`;
 			if (outcome === "timeout") {
 				this.staleReviews++;
 				this.invalidateActiveReview("agent-end timeout");
@@ -506,11 +444,16 @@ export class MainWatchdogRuntime {
 				this.resolveWaiters(true);
 				return;
 			}
-			if (outcome === "completed" && this.status !== "failed" && this.status !== "stale") {
+			if ((outcome === "completed" || typeof outcome === "object") && this.status !== "failed" && this.status !== "stale") {
+				// A question consumes this evidence just like a completed review, not a pending exchange.
 				this.lastReviewInputSignature = signature;
 				if (changeSignature) this.lastReviewedChangeSignature = changeSignature.key;
 				this.currentChangedPaths = changeSignature?.changedPaths;
 				this.status = "idle";
+				if (typeof outcome === "object" && !ctx.signal?.aborted) this.displayClarification?.([
+					"Main watchdog clarification:", outcome.question, `Evidence: ${outcome.evidence}`,
+					"Consider this missing context as you continue the task. This is not approval, permission, or a warning. The reviewer has yielded; no reply or follow-up review is required.",
+				].join("\n"));
 			}
 			this.resolveWaiters(true);
 		} finally {
@@ -558,78 +501,16 @@ export class MainWatchdogRuntime {
 			reviewTrigger: this.reviewChangesOnly ? "repo-edits" : "turn-delta",
 			...(this.currentChangedPaths?.length ? { changedPaths: [...this.currentChangedPaths] } : {}),
 			lsp: this.lspSnapshot(),
-			...(this.clarificationStatus ? { clarification: { ...this.clarificationStatus } } : {}),
 		};
-	}
-
-	/** Receipt only: the next boundary, never this tool call, runs the fresh review. */
-	replyToClarification(id: string, message: string, ctx: ContextLike): void {
-		this.refreshConfig(ctx.cwd);
-		const pending = this.pendingClarification;
-		if (!pending || !this.isEnabled() || !this.configResult.config.clarification || ctx.signal?.aborted || pending.epoch !== this.epoch || pending.id !== id || pending.reply !== undefined) throw new Error("No matching unanswered main-watchdog clarification.");
-		if (Date.now() >= pending.expiresAt) {
-			this.closeClarification("expired");
-			throw new Error("Watchdog clarification expired.");
-		}
-		if (!message.trim()) throw new Error("watchdog.reply requires a non-empty message.");
-		pending.reply = boundWatchdogReviewText(message.trim(), 4_000);
-		clearTimeout(pending.timer);
-		pending.timer = undefined;
-		if (this.clarificationStatus) this.clarificationStatus.state = "answered";
-	}
-
-	/** Native automatic continuation has its own abort signal, but not a new prompt epoch. */
-	handleAgentStart(ctx: ContextLike): void {
-		const pending = this.pendingClarification;
-		if (!pending || !ctx.signal) return;
-		const signal = ctx.signal;
-		pending.removeAbortListener?.();
-		const abort = () => { if (this.pendingClarification === pending) this.closeClarification("aborted"); };
-		signal.addEventListener("abort", abort, { once: true });
-		pending.removeAbortListener = () => signal.removeEventListener("abort", abort);
-		if (signal.aborted) abort();
 	}
 
 	/** A real mid-stream user input can steer without emitting before_agent_start. */
 	handleUserInput(): void {
-		if (this.displayClarification && this.configResult.config.clarification && (this.pendingClarification || this.reviewing || this.waitingAtAgentEnd)) this.reset("new user input");
+		if (this.displayClarification && this.configResult.config.clarification && (this.reviewing || this.waitingAtAgentEnd)) this.reset("new user input");
 	}
 
 	handleModelChange(): void {
-		if (this.displayClarification && this.configResult.config.clarification && (this.pendingClarification || this.reviewing || this.waitingAtAgentEnd)) this.reset("model changed");
-	}
-
-	private openClarification(question: NonNullable<WatchdogReviewResult["clarification"]>, delta: string, repoSignature: string | undefined, reviewSignature: string | undefined, activityVersion: number, signal?: AbortSignal): void {
-		if (signal?.aborted) return;
-		const pending: PendingClarification = { ...question, id: randomUUID(), epoch: this.epoch, activityVersion, delta, repoSignature, expiresAt: Date.now() + 60_000 };
-		this.pendingClarification = pending;
-		this.lastQuestionRepoSignature = reviewSignature;
-		this.clarificationStatus = { id: pending.id, state: "pending", expiresAt: pending.expiresAt };
-		pending.timer = setTimeout(() => {
-			if (this.pendingClarification === pending) this.closeClarification("expired");
-		}, 60_000);
-		pending.timer.unref?.();
-		this.handleAgentStart({ cwd: this.cwd, signal });
-		this.displayClarification?.([
-			`Main watchdog clarification ${pending.id} (expires ${new Date(pending.expiresAt).toISOString()}).`,
-			pending.question,
-			`Evidence: ${pending.evidence}`,
-			`Answer before changing files using subagent({ action: "watchdog.reply", id: "${pending.id}", message: "your answer" }). Freeform prose is not a reply.`,
-			"This question is not approval or permission. The reviewer has yielded; your answer will be considered by one fresh review. To cancel, disable watchdog or submit a new user prompt; unanswered requests close at the next boundary or after 60 seconds.",
-		].join("\n"), true);
-	}
-
-	private closeClarification(reason: string, notify = true): void {
-		const pending = this.pendingClarification;
-		if (!pending) {
-			if (this.clarificationStatus?.state === "reviewing reply") this.clarificationStatus.state = reason;
-			return;
-		}
-		this.pendingClarification = undefined;
-		clearTimeout(pending.timer);
-		pending.removeAbortListener?.();
-		this.clarificationStatus = { id: pending.id, state: reason, expiresAt: pending.expiresAt };
-		if (notify) this.displayClarification?.(`Main watchdog clarification ${pending.id} closed: ${reason}. This is neither approval nor a warning.`, false);
+		if (this.displayClarification && this.configResult.config.clarification && (this.reviewing || this.waitingAtAgentEnd)) this.reset("model changed");
 	}
 
 	async waitForIdle(timeoutMs = 1_000): Promise<boolean> {
@@ -687,7 +568,6 @@ export class MainWatchdogRuntime {
 	}
 
 	private invalidateActiveReview(_reason: string): void {
-		this.closeClarification(_reason);
 		this.activeReviewAbortController?.abort();
 		this.abortActiveAgentEnd();
 		this.epoch++;
@@ -987,7 +867,7 @@ export class MainWatchdogRuntime {
 	private clearActivity(): void {
 		if (!this.activityTail) return;
 		this.activityTail = "";
-		this.activityVersion = this.reviewedActivityVersion = 0;
+		this.activityPending = false;
 	}
 
 	private fail(message: string): void {
