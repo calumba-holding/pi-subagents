@@ -91,6 +91,7 @@ export async function steerWorkflowForegroundTarget(input: {
 
 	const message = input.message.trim();
 	const requestId = randomUUID();
+
 	const outcome = await child.steer({ message, ...(input.mode && input.mode !== "steer" ? { mode: input.mode } : {}) });
 	const target = outcome.state === "delivered"
 		? { index, state: "delivered" as const, deliveredAt: Date.now() }

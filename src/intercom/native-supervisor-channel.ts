@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ChildSupervisorMetadata } from "../runs/shared/child-runtime-config.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, POLL_INTERVAL_MS, TEMP_ROOT_DIR, type ControlEvent, type IntercomEventBus, type SubagentState } from "../shared/types.ts";
@@ -381,18 +381,8 @@ function cleanupStaleEmptySupervisorChannels(nowMs = Date.now()): number {
 	return removed;
 }
 
-function currentContextSessionId(state: Pick<SubagentState, "currentSessionId">, ctx: ExtensionContext): string | undefined {
-	try {
-		const sessionId = ctx.sessionManager.getSessionId();
-		if (sessionId) return sessionId;
-	} catch {
-		// Fall through to the last known identity.
-	}
-	return state.currentSessionId ?? undefined;
-}
-
-function requestMatchesContext(request: SupervisorRequest, state: Pick<SubagentState, "currentSessionId">, ctx: ExtensionContext): boolean {
-	const currentSessionId = currentContextSessionId(state, ctx);
+function requestMatchesOwner(request: SupervisorRequest, state: Pick<SubagentState, "supervisorOwnerSessionId">): boolean {
+	const currentSessionId = state.supervisorOwnerSessionId;
 	return Boolean(currentSessionId && request.orchestratorSessionId === currentSessionId);
 }
 
@@ -462,8 +452,8 @@ function requestRunInactive(request: SupervisorRequest, state: SubagentState): b
 	return stepStatus === "complete" || stepStatus === "completed" || stepStatus === "failed" || stepStatus === "paused";
 }
 
-function requestLifecycle(request: PendingSupervisorRequest, state: SubagentState, ctx: ExtensionContext | undefined, now: number): SupervisorRequestLifecycle {
-	if (ctx && !requestMatchesContext(request, state, ctx)) return "wrong-session";
+function requestLifecycle(request: PendingSupervisorRequest, state: SubagentState, now: number): SupervisorRequestLifecycle {
+	if (!requestMatchesOwner(request, state)) return "wrong-session";
 	if (!fs.existsSync(request.requestFile)) return "missing";
 	if (request.expectsReply && fs.existsSync(replyPath(request.channelDir, request.id))) return "resolved";
 	if (request.expectsReply && now > requestExpiresAt(request, now)) return "expired";
@@ -475,10 +465,10 @@ function cleanupRequestLifecycle(request: PendingSupervisorRequest, lifecycle: S
 	if (lifecycle === "resolved" || lifecycle === "expired" || lifecycle === "inactive") removeRequestFile(request.requestFile);
 }
 
-function refreshPendingRequests(pending: Map<string, PendingSupervisorRequest>, state: SubagentState, ctx: ExtensionContext | undefined, onLifecycle: SupervisorRequestLifecycleObserver): void {
+function refreshPendingRequests(pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver): void {
 	const now = Date.now();
 	for (const request of pending.values()) {
-		const lifecycle = requestLifecycle(request, state, ctx, now);
+		const lifecycle = requestLifecycle(request, state, now);
 		if (lifecycle === "pending") continue;
 		pending.delete(request.id);
 		onLifecycle(request, lifecycle);
@@ -563,6 +553,7 @@ function resolvePendingRequest(pending: Map<string, PendingSupervisorRequest>, p
 		);
 		if (matches.length === 1) return matches[0]!;
 		if (matches.length > 1) throw new Error(`Multiple pending supervisor requests match '${params.to}'. Use replyTo.`);
+		throw new Error(`No pending supervisor request matches '${params.to}'. Use replyTo.`);
 	}
 	if (requests.length === 1) return requests[0]!;
 	if (requests.length === 0) throw new Error("No pending supervisor requests need a reply.");
@@ -580,14 +571,21 @@ function publicPendingRequests(pending: Map<string, PendingSupervisorRequest>): 
 	}));
 }
 
-function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver): ToolDefinition<typeof IntercomParamsSchema, Record<string, unknown>> {
+function buildParentSupervisorTool(pi: ExtensionAPI, pending: Map<string, PendingSupervisorRequest>, state: SubagentState, onLifecycle: SupervisorRequestLifecycleObserver, discover: () => void): ToolDefinition<typeof IntercomParamsSchema, Record<string, unknown>> {
 	return {
 		name: NATIVE_SUPERVISOR_TOOL_NAME,
 		label: "Subagent Supervisor",
 		description: "Native pi-subagents supervisor channel. Use reply/pending/status to answer child subagent requests without overriding pi-intercom.",
 		parameters: IntercomParamsSchema,
 		async execute(_id, params) {
-			refreshPendingRequests(pending, state, state.lastUiContext ?? undefined, onLifecycle);
+			// Scan the channel root before answering. `refreshPendingRequests` only re-evaluates asks
+			// ALREADY in `pending`; it never reads the filesystem. Because no fs watcher is installed on
+			// darwin and the 500ms poller is demand-gated and self-cancelling, an ask written while
+			// nothing was polling stayed invisible and every `action:"pending"` reported "No pending
+			// supervisor requests" while the child blocked in contact_supervisor. An explicit supervisor
+			// query must always be authoritative against disk.
+			discover();
+			refreshPendingRequests(pending, state, onLifecycle);
 			const input = params as IntercomParams;
 			if (input.action === "status") {
 				return { content: [{ type: "text", text: `Native supervisor channel active. Pending replies: ${pending.size}.` }], details: { active: true, pending: pending.size, root: SUPERVISOR_CHANNEL_ROOT } };
@@ -690,7 +688,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	};
 
 	const registerParentTools = (): void => {
-		if (!hasTool(pi, NATIVE_SUPERVISOR_TOOL_NAME)) pi.registerTool(buildParentSupervisorTool(pi, pending, state, observeRequestLifecycle));
+		if (!hasTool(pi, NATIVE_SUPERVISOR_TOOL_NAME)) pi.registerTool(buildParentSupervisorTool(pi, pending, state, observeRequestLifecycle, () => poll()));
 	};
 
 	const cleanupStaleChannelsIfDue = (): void => {
@@ -706,15 +704,17 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 
 	const poll = (): void => {
 		cleanupStaleChannelsIfDue();
-		const ctx = state.lastUiContext;
-		if (!ctx) return;
-		refreshPendingRequests(pending, state, ctx, observeRequestLifecycle);
+		// Registration must not require a live UI context. Returning early whenever
+		// `state.lastUiContext` was null (never set yet, or nulled by a stale-context error) meant an
+		// ask written by a child was never read off disk, so `subagent_supervisor({action:"pending"})`
+		// reported nothing. The queue is authoritative; only the display notification needs the context.
+		refreshPendingRequests(pending, state, observeRequestLifecycle);
 		const now = Date.now();
 		for (const { channelDir, file } of listRequestFiles()) {
 			if (seenFiles.has(file)) continue;
 			const request = parseRequestFile(file, channelDir);
-			if (!request || !requestMatchesContext(request, state, ctx)) continue;
-			const lifecycle = requestLifecycle(request, state, undefined, now);
+			if (!request || !requestMatchesOwner(request, state)) continue;
+			const lifecycle = requestLifecycle(request, state, now);
 			if (lifecycle !== "pending") {
 				seenFiles.add(file);
 				observeRequestLifecycle(request, lifecycle);
@@ -727,27 +727,34 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 				pending.set(request.id, request);
 				markForegroundSupervisorAttention(request, state);
 			}
-			else {
-				removeRequestFile(request.requestFile);
+			// The ask is already queued above. A sendMessage failure (no UI, stale context) must not
+			// lose it, and must not abort the loop before the remaining asks register.
+			try {
+				pi.sendMessage({
+					customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
+					content: requestVisibleText(request),
+					display: true,
+					details: {
+						id: request.id,
+						requestId: request.id,
+						reason: request.reason,
+						expectsReply: request.expectsReply,
+						runId: request.runId,
+						agent: request.agent,
+						childIndex: request.childIndex,
+						...(request.childTarget ? { childTarget: request.childTarget } : {}),
+						...(request.interview !== undefined ? { interview: request.interview } : {}),
+						requestBody: request.message,
+						...(request.expectsReply ? { replyHint: supervisorReplyHint(request.id) } : {}),
+					},
+				}, { triggerTurn: true });
+				// sendMessage accepts synchronously; one-way updates stay on disk until it returns.
+				if (!request.expectsReply) removeRequestFile(request.requestFile);
+			} catch (error) {
+				// Allow an existing later scan to retry an unaccepted one-way update.
+				if (!request.expectsReply) seenFiles.delete(file);
+				console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
 			}
-			pi.sendMessage({
-				customType: SUPERVISOR_REQUEST_MESSAGE_TYPE,
-				content: requestVisibleText(request),
-				display: true,
-				details: {
-					id: request.id,
-					requestId: request.id,
-					reason: request.reason,
-					expectsReply: request.expectsReply,
-					runId: request.runId,
-					agent: request.agent,
-					childIndex: request.childIndex,
-					...(request.childTarget ? { childTarget: request.childTarget } : {}),
-					...(request.interview !== undefined ? { interview: request.interview } : {}),
-					requestBody: request.message,
-					...(request.expectsReply ? { replyHint: supervisorReplyHint(request.id) } : {}),
-				},
-			}, { triggerTurn: true });
 			if (request.expectsReply) {
 				(pi as { events?: IntercomEventBus }).events?.emit(INTERCOM_DETACH_REQUEST_EVENT, {
 					requestId: request.id,
