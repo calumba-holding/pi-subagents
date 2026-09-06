@@ -443,6 +443,7 @@ interface ExecutorDeps {
 	onAgentsChanged?: () => void;
 	allowMutatingManagementActions?: boolean;
 	activateSupervisorTransport?: () => void;
+	findPendingAsks?: Parameters<typeof steerAsyncRun>[0]["findPendingAsks"];
 	refreshResultDelivery?: () => void;
 	trackRetainedNestedRoute?: (rootRunId: string) => void;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
@@ -4844,6 +4845,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		signal: AbortSignal,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
+	/** Scheduled state visible to the current runtime supervisor owner only. */
+	getCurrentSupervisorOwnerStates: () => Iterable<SubagentState>;
 } {
 	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
 	const delegatedZeroToolBudgets = new WeakSet<object>();
@@ -4852,7 +4855,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 	const workflowResourcePermits = new WeakMap<object, WorkflowResourcePermit>();
 	const workflowPermitContexts = new WeakMap<object, { root: WorkflowChildPermit } | { child: WorkflowChildPermitContext }>();
 	const warnedArtifactPackageDirs = new Set<string>();
-	const scheduledOwnerExecutors = new Map<string, ReturnType<typeof createSubagentExecutor>>();
+	const scheduledOwnerExecutors = new Map<string | null, Map<string, { state: SubagentState; executor: ReturnType<typeof createSubagentExecutor> }>>();
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -5360,6 +5363,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					// Steering is an optional control surface, so a watcher that cannot install must not fail the run.
 					appendWorkflowEvent({ type: "subagent.workflow.steer_inbox_unavailable", error: error instanceof Error ? error.message : String(error) });
 				}
+				deps.activateSupervisorTransport?.();
 				const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
 				let workflowSteerInboxClosed = false;
 				const settleWorkflowSteerInbox = (outcome = status.state): void => {
@@ -6340,6 +6344,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						}
 						return steerAsyncRun(compactOptional<Parameters<typeof steerAsyncRun>[0]>({
 							state: deps.state,
+							findPendingAsks: deps.findPendingAsks,
 							runId,
 							message,
 							mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode),
@@ -6387,6 +6392,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				}
 				return steerAsyncRun(compactOptional<Parameters<typeof steerAsyncRun>[0]>({
 					state: deps.state,
+					findPendingAsks: deps.findPendingAsks,
 					runId: resolved.id,
 					message,
 					mode: resolveSteerDeliveryMode(paramsWithResolvedCwd.mode),
@@ -7287,16 +7293,27 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		ctx: ExtensionContext,
 	) => {
 		const ownerSessionId = resolveCurrentSessionId(ctx.sessionManager);
-		let ownerExecutor = scheduledOwnerExecutors.get(ownerSessionId);
-		if (!ownerExecutor) {
-			ownerExecutor = createSubagentExecutor({
-				...deps,
-				state: createScheduledOwnerState(deps.state, ownerSessionId, ctx),
-			});
-			scheduledOwnerExecutors.set(ownerSessionId, ownerExecutor);
+		const runtimeOwnerId = ctx.sessionManager.getSessionId() || null;
+		let ownerExecutors = scheduledOwnerExecutors.get(runtimeOwnerId);
+		if (!ownerExecutors) {
+			ownerExecutors = new Map();
+			scheduledOwnerExecutors.set(runtimeOwnerId, ownerExecutors);
 		}
-		return ownerExecutor.executePublic(id, params, signal, undefined, ctx);
+		let owner = ownerExecutors.get(ownerSessionId);
+		if (!owner) {
+			const state = createScheduledOwnerState(deps.state, ownerSessionId, ctx);
+			owner = { state, executor: createSubagentExecutor({ ...deps, state }) };
+			ownerExecutors.set(ownerSessionId, owner);
+		}
+		return owner.executor.executePublic(id, params, signal, undefined, ctx);
 	};
 
-	return { execute: executeWithSingleDispatchGuard, executePublic, executeDelegated, executeScheduled };
+	function* getCurrentSupervisorOwnerStates(): Iterable<SubagentState> {
+		const ownerId = deps.state.supervisorOwnerSessionId;
+		if (!ownerId) return;
+		// File transitions remain separate entries; other runtime owners are never scanned.
+		for (const owner of scheduledOwnerExecutors.get(ownerId)?.values() ?? []) yield owner.state;
+	}
+
+	return { execute: executeWithSingleDispatchGuard, executePublic, executeDelegated, executeScheduled, getCurrentSupervisorOwnerStates };
 }

@@ -490,7 +490,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}, run);
 	};
 
-	const supervisorChannel = createNativeSupervisorChannel(pi, state);
+	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
+		getCurrentOwnerStates: () => executor.getCurrentSupervisorOwnerStates(),
+	});
 	const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
 	const mainWatchdog = registerMainWatchdog(pi);
 	const resultDeliveryOwnership = createResultDeliveryOwnership(state);
@@ -628,6 +630,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 		},
 		activateSupervisorTransport: () => supervisorChannel.activateTransport(),
+		findPendingAsks: (target) => supervisorChannel.findPendingAsks(target),
 		refreshResultDelivery: () => refreshResultDelivery(),
 		trackRetainedNestedRoute: undefined,
 	};
